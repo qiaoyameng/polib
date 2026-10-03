@@ -97,6 +97,53 @@ def _is_file(filename_or_contents):
     except (TypeError, ValueError, UnicodeEncodeError):
         return False
 # }}}
+# _next_prime {{{
+
+
+def _next_prime(n):
+    """
+    Returns the smallest prime number greater than or equal to ``n``.
+    Used to compute the size of the .mo hash table, as GNU msgfmt does.
+    """
+    def is_prime(num):
+        if num < 2:
+            return False
+        if num % 2 == 0:
+            return num == 2
+        i = 3
+        while i * i <= num:
+            if num % i == 0:
+                return False
+            i += 2
+        return True
+
+    if n <= 2:
+        return 2
+    candidate = n if n % 2 == 1 else n + 1
+    while not is_prime(candidate):
+        candidate += 2
+    return candidate
+# }}}
+# _hashpjw {{{
+
+
+def _hashpjw(msgid):
+    """
+    Returns the hash of ``msgid`` (a byte string) as computed by the
+    "PJW" hash function used in GNU gettext .mo hash tables. The hash is
+    always a 32 bits unsigned integer.
+    """
+    hash_value = 0
+    for char in msgid:
+        if not isinstance(char, int):
+            char = ord(char)
+        hash_value = (hash_value << 4) + char
+        g = hash_value & 0xf0000000
+        if g != 0:
+            hash_value ^= g >> 24
+            hash_value ^= g
+    return hash_value & 0xffffffff
+# }}}
 # function pofile() {{{
 
 
@@ -429,7 +476,8 @@ class _BaseFile(list):
             e.flags.append('fuzzy')
         return e
 
-    def save(self, fpath=None, repr_method='__unicode__', newline=None):
+    def save(self, fpath=None, repr_method='__unicode__', newline=None,
+             repr_kwargs=None):
         """
         Saves the po file to ``fpath``.
         If it is an existing file and no ``fpath`` is provided, then the
@@ -445,10 +493,15 @@ class _BaseFile(list):
 
         ``newline``
             string, controls how universal newlines works
+
+        ``repr_kwargs``
+            dict, keyword arguments to pass to the repr method.
         """
         if self.fpath is None and fpath is None:
             raise IOError('You must provide a file path to save() method')
-        contents = getattr(self, repr_method)()
+        if repr_kwargs is None:
+            repr_kwargs = {}
+        contents = getattr(self, repr_method)(**repr_kwargs)
         if fpath is None:
             fpath = self.fpath
         if repr_method == 'to_binary':
@@ -550,9 +603,15 @@ class _BaseFile(list):
             ordered_data.append((data, value))
         return ordered_data
 
-    def to_binary(self):
+    def to_binary(self, with_hash_table=False):
         """
         Return the binary representation of the file.
+
+        Keyword argument:
+
+        ``with_hash_table``
+            boolean, whether to include a GNU gettext compatible hash
+            table of the entry keys in the output (default: ``False``).
         """
         offsets = []
         entries = self.translated_entries()
@@ -574,6 +633,7 @@ class _BaseFile(list):
         entries = [mentry] + entries
         entries_len = len(entries)
         ids, strs = b(''), b('')
+        keys = []
         for e in entries:
             # For each string, we need size and file offset.  Each string is
             # NUL terminated; the NUL does not count into the size.
@@ -591,12 +651,33 @@ class _BaseFile(list):
             else:
                 msgid += self._encode(e.msgid)
                 msgstr = self._encode(e.msgstr)
+            keys.append(msgid)
             offsets.append((len(ids), len(msgid), len(strs), len(msgstr)))
             ids += msgid + b('\0')
             strs += msgstr + b('\0')
 
         # The header is 7 32-bit unsigned integers.
         keystart = 7 * 4 + 16 * entries_len
+        # build the hash table of the entry keys if requested, it is
+        # stored right after the two string index arrays, before the
+        # strings themselves
+        hash_size = 0
+        hash_table = []
+        if with_hash_table:
+            # as GNU msgfmt does: the hash table size is the smallest
+            # prime >= 4/3 of the number of entries (with a minimum of 3)
+            hash_size = _next_prime(max(entries_len, 3) * 4 // 3)
+            hash_table = [0] * hash_size
+            for entry_index, key in enumerate(keys):
+                # entry numbers stored in the hash table are 1-based, a
+                # zero value marks an empty slot
+                hash_value = _hashpjw(key)
+                index = hash_value % hash_size
+                step = 1 + (hash_value % (hash_size - 2))
+                while hash_table[index] != 0:
+                    index = (index + step) % hash_size
+                hash_table[index] = entry_index + 1
+            keystart += hash_size * 4
         # and the values start after the keys
         valuestart = keystart + len(ids)
         koffsets = []
@@ -606,7 +687,7 @@ class _BaseFile(list):
         for o1, l1, o2, l2 in offsets:
             koffsets += [l1, o1 + keystart]
             voffsets += [l2, o2 + valuestart]
-        offsets = koffsets + voffsets
+        offsets = koffsets + voffsets + hash_table
 
         output = struct.pack(
             "Iiiiiii",
@@ -620,8 +701,8 @@ class _BaseFile(list):
             7 * 4,
             # start of value index
             7 * 4 + entries_len * 8,
-            # size and offset of hash table, we don't use hash tables
-            0, keystart
+            # size and offset of the hash table (empty by default)
+            hash_size, 7 * 4 + 16 * entries_len
 
         )
         if PY3 and sys.version_info.minor > 1:  # python 3.2 or superior
@@ -669,7 +750,7 @@ class POFile(_BaseFile):
 
         return ret + _BaseFile.__unicode__(self)
 
-    def save_as_mofile(self, fpath):
+    def save_as_mofile(self, fpath, with_hash_table=False):
         """
         Saves the binary representation of the file to given ``fpath``.
 
@@ -677,8 +758,17 @@ class POFile(_BaseFile):
 
         ``fpath``
             string, full or relative path to the mo file.
+
+        ``with_hash_table``
+            boolean, whether to include a GNU gettext compatible hash
+            table of the entry keys in the output (default: ``False``).
         """
-        _BaseFile.save(self, fpath, 'to_binary')
+        _BaseFile.save(
+            self,
+            fpath,
+            'to_binary',
+            repr_kwargs={'with_hash_table': with_hash_table}
+        )
 
     def percent_translated(self):
         """
@@ -781,7 +871,7 @@ class MOFile(_BaseFile):
         """
         _BaseFile.save(self, fpath)
 
-    def save(self, fpath=None):
+    def save(self, fpath=None, with_hash_table=False):
         """
         Saves the mofile to ``fpath``.
 
@@ -789,8 +879,17 @@ class MOFile(_BaseFile):
 
         ``fpath``
             string, full or relative path to the file.
+
+        ``with_hash_table``
+            boolean, whether to include a GNU gettext compatible hash
+            table of the entry keys in the output (default: ``False``).
         """
-        _BaseFile.save(self, fpath, 'to_binary')
+        _BaseFile.save(
+            self,
+            fpath,
+            'to_binary',
+            repr_kwargs={'with_hash_table': with_hash_table}
+        )
 
     def percent_translated(self):
         """

@@ -3,6 +3,7 @@
 
 import codecs
 import os
+import struct
 import subprocess
 import sys
 import tempfile
@@ -17,6 +18,7 @@ sys.path.insert(1, os.path.abspath('.'))
 import polib
 
 from polib import u
+from mo_hash_lookup import MOHashLookup
 
 class TestFunctions(unittest.TestCase):
 
@@ -875,6 +877,234 @@ msgid "foo"
 msgstr "oof"
 ''')
         self.assertEqual(mo.__unicode__(), expected)
+
+
+class TestMOHashTable(unittest.TestCase):
+    """
+    Tests for the optional GNU hash table in mo exports.
+    """
+
+    def _make_pofile(self, entries):
+        po = polib.POFile()
+        po.metadata = {
+            'Content-Type': 'text/plain; charset=utf-8',
+        }
+        for entry in entries:
+            po.append(polib.POEntry(**entry))
+        return po
+
+    def _is_prime(self, num):
+        if num < 2:
+            return False
+        i = 2
+        while i * i <= num:
+            if num % i == 0:
+                return False
+            i += 1
+        return True
+
+    def _colliding_keys(self, hash_size, slot, count, start=0):
+        """
+        Returns ``count`` msgids whose GNU hash maps to ``slot`` in a
+        table of size ``hash_size``, plus the next free counter value.
+        """
+        keys = []
+        i = start
+        while len(keys) < count:
+            candidate = 'collide-%d' % i
+            i += 1
+            if MOHashLookup._hash(candidate.encode('utf-8')) % hash_size == slot:
+                keys.append(candidate)
+        return keys, i
+
+    def _to_big_endian(self, data):
+        """
+        Rewrites a little endian mo file (as produced by to_binary on
+        common platforms) to the big endian variant.
+        """
+        fields = struct.unpack('<7I', data[:28])
+        num_strings, hash_size = fields[2], fields[5]
+        num_words = 4 * num_strings + hash_size
+        words = struct.unpack('<%dI' % num_words, data[28:28 + 4 * num_words])
+        tail = data[28 + 4 * num_words:]
+        return (
+            struct.pack('>7I', 0x950412de, *fields[1:]) +
+            struct.pack('>%dI' % num_words, *words) +
+            tail
+        )
+
+    def test_no_hash_table_by_default(self):
+        """
+        The default mo export keeps an empty hash table section.
+        """
+        po = self._make_pofile([{'msgid': 'foo', 'msgstr': 'bar'}])
+        data = po.to_binary()
+        num_strings = struct.unpack('<I', data[8:12])[0]
+        hash_size, hash_offset = struct.unpack('<2I', data[20:28])
+        self.assertEqual(hash_size, 0)
+        # the strings start right after the two index arrays
+        self.assertEqual(hash_offset, 7 * 4 + 16 * num_strings)
+        self.assertRaises(ValueError, MOHashLookup, data)
+
+    def test_hash_table_layout(self):
+        """
+        The hash table follows the GNU layout: size and offset in the
+        header, 1-based entry numbers, strings stored after the table.
+        """
+        entries = [
+            {'msgid': 'foo', 'msgstr': 'bar'},
+            {'msgid': 'hello', 'msgstr': 'bonjour'},
+            {'msgid': 'goodbye', 'msgstr': 'au revoir'},
+        ]
+        po = self._make_pofile(entries)
+        data = po.to_binary(with_hash_table=True)
+        (
+            magic, version, num_strings, msgids_offset, msgstrs_offset,
+            hash_size, hash_offset
+        ) = struct.unpack('<7I', data[:28])
+        num_entries = len(entries) + 1  # + 1 for the metadata entry
+        self.assertEqual(num_strings, num_entries)
+        self.assertEqual(msgids_offset, 7 * 4)
+        self.assertEqual(msgstrs_offset, 7 * 4 + 8 * num_entries)
+        self.assertEqual(hash_offset, 7 * 4 + 16 * num_entries)
+        # the size is a prime large enough to keep the load factor sane
+        self.assertTrue(self._is_prime(hash_size))
+        self.assertGreaterEqual(hash_size, num_entries * 4 // 3)
+        # entry numbers are 1-based and cover each entry exactly once
+        table = struct.unpack(
+            '<%dI' % hash_size, data[hash_offset:hash_offset + 4 * hash_size]
+        )
+        self.assertEqual(
+            sorted(table),
+            [0] * (hash_size - num_entries) + list(range(1, num_entries + 1))
+        )
+        # the strings are stored right after the hash table
+        first_key_offset = struct.unpack('<2I', data[28:36])[1]
+        self.assertEqual(first_key_offset, hash_offset + 4 * hash_size)
+        # the file is still readable by polib
+        mo = polib.mofile(data)
+        self.assertEqual(len(mo), len(entries))
+        self.assertEqual(mo.find('hello').msgstr, 'bonjour')
+
+    def test_lookup_with_colliding_keys(self):
+        """
+        Keys that collide in the hash table are all found through the
+        probing sequence, unknown keys terminate in bounded probes.
+        """
+        num_groups, group_size = 3, 3
+        num_entries = num_groups * group_size + 1  # + 1 for metadata
+        hash_size = polib._next_prime(max(num_entries, 3) * 4 // 3)
+        keys = []
+        start = 0
+        for slot in range(num_groups):
+            group, start = self._colliding_keys(
+                hash_size, slot, group_size, start
+            )
+            keys.extend(group)
+        entries = [
+            {'msgid': key, 'msgstr': 'translation of %s' % key}
+            for key in keys
+        ]
+        po = self._make_pofile(entries)
+        data = po.to_binary(with_hash_table=True)
+        lookup = MOHashLookup(data)
+        self.assertEqual(lookup.hash_size, hash_size)
+        # sanity check: the generated keys really collide per group
+        for slot in range(num_groups):
+            group = keys[slot * group_size:(slot + 1) * group_size]
+            slots = set(
+                MOHashLookup._hash(key.encode('utf-8')) % hash_size
+                for key in group
+            )
+            self.assertEqual(slots, set([slot]))
+        # every colliding key resolves to its own translation
+        for key in keys:
+            self.assertEqual(lookup.lookup(key), 'translation of %s' % key)
+        # the metadata entry is reachable through the hash table
+        self.assertIn('Content-Type', lookup.lookup(''))
+        # unknown keys return None, including keys that land in the
+        # middle of a collision cluster
+        self.assertIsNone(lookup.lookup('no-such-key'))
+        missing, _next = self._colliding_keys(hash_size, 0, 1, start=10 ** 6)
+        self.assertIsNone(lookup.lookup(missing[0]))
+
+    def test_lookup_msgctxt_and_plural(self):
+        """
+        The hash covers the msgctxt prefix and the plural separator, so
+        context and plural variants of a same msgid stay distinct.
+        """
+        po = self._make_pofile([
+            {
+                'msgid': 'some string',
+                'msgstr': u('une cha\u00eene sans contexte'),
+            },
+            {
+                'msgid': 'some string',
+                'msgstr': u('une cha\u00eene avec contexte'),
+                'msgctxt': 'Some context',
+            },
+            {
+                'msgid': 'singular',
+                'msgid_plural': 'plural',
+                'msgstr_plural': {0: 'singulier', 1: 'pluriel'},
+                'msgctxt': 'Some context',
+            },
+        ])
+        data = po.to_binary(with_hash_table=True)
+        lookup = MOHashLookup(data)
+        self.assertEqual(
+            lookup.lookup('some string'),
+            u('une cha\u00eene sans contexte')
+        )
+        self.assertEqual(
+            lookup.lookup('some string', msgctxt='Some context'),
+            u('une cha\u00eene avec contexte')
+        )
+        self.assertEqual(
+            lookup.lookup(
+                'singular', msgctxt='Some context', msgid_plural='plural'
+            ),
+            ['singulier', 'pluriel']
+        )
+        self.assertIsNone(lookup.lookup('singular'))
+        self.assertIsNone(lookup.lookup('some string', msgctxt='Other'))
+
+    def test_lookup_big_endian(self):
+        """
+        Hash tables written with a different byte order stay readable.
+        """
+        po = self._make_pofile([
+            {'msgid': 'foo', 'msgstr': 'bar'},
+            {'msgid': 'hello', 'msgstr': 'bonjour'},
+        ])
+        data = self._to_big_endian(po.to_binary(with_hash_table=True))
+        lookup = MOHashLookup(data)
+        self.assertEqual(lookup.lookup('foo'), 'bar')
+        self.assertEqual(lookup.lookup('hello'), 'bonjour')
+        self.assertIsNone(lookup.lookup('missing'))
+        # polib reads the big endian file as well
+        mo = polib.mofile(data)
+        self.assertEqual(mo.find('foo').msgstr, 'bar')
+
+    def test_save_as_mofile_with_hash_table(self):
+        """
+        The with_hash_table option is honored by save() and
+        save_as_mofile().
+        """
+        po = self._make_pofile([{'msgid': 'foo', 'msgstr': 'bar'}])
+        fd, tmpfile = tempfile.mkstemp()
+        os.close(fd)
+        try:
+            po.save_as_mofile(tmpfile, with_hash_table=True)
+            lookup = MOHashLookup(tmpfile)
+            self.assertEqual(lookup.lookup('foo'), 'bar')
+            mo = polib.mofile(tmpfile)
+            self.assertEqual(mo.find('foo').msgstr, 'bar')
+            # saving again without the option keeps the table empty
+            mo.save(tmpfile)
+            self.assertRaises(ValueError, MOHashLookup, tmpfile)
+        finally:
+            os.remove(tmpfile)
 
 
 if __name__ == '__main__':
