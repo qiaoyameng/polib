@@ -2,6 +2,8 @@
 # -*- coding: utf-8 -*-
 
 import codecs
+import difflib
+import glob
 import os
 import subprocess
 import sys
@@ -875,6 +877,387 @@ msgid "foo"
 msgstr "oof"
 ''')
         self.assertEqual(mo.__unicode__(), expected)
+
+
+class TestPreserveLayout(unittest.TestCase):
+    """
+    Tests for the preserve_layout mode: unmodified lexical sections must
+    be saved back byte-identically and only modified fields rewritten.
+    """
+
+    sample = (
+        u'# Project header\n'
+        u'#  with  weird spacing\n'
+        u'#\n'
+        u'msgid ""\n'
+        u'msgstr ""\n'
+        u'"Project-Id-Version: sample 1.0\\n"\n'
+        u'"Content-Type: text/plain; charset=utf-8\\n"\n'
+        u'\n'
+        u'# translator comment\n'
+        u'#. generated comment\n'
+        u'#: src/main.c:42\n'
+        u'#, fuzzy, c-format\n'
+        u'msgctxt "button"\n'
+        u'msgid "foo"\n'
+        u'msgstr "hand "\n'
+        u'"wrapped "\n'
+        u'"translation"\n'
+        u'\n'
+        u'msgctxt "menu"\n'
+        u'msgid "foo"\n'
+        u'msgstr "bar"\n'
+        u'\n'
+        u'#| msgctxt "old ctx"\n'
+        u'#| msgid "old "\n'
+        u'#| "foo"\n'
+        u'msgid "with previous"\n'
+        u'msgstr "avec previous"\n'
+        u'\n'
+        u'msgid "item"\n'
+        u'msgid_plural "items"\n'
+        u'msgstr[0] "one item"\n'
+        u'msgstr[1] "many "\n'
+        u'"items"\n'
+        u'\n'
+        u'#~ msgid "obsolete entry"\n'
+        u'#~ msgstr "obsolete translation"\n'
+        u'\n'
+        u'# trailing comment\n'
+    )
+
+    latin1_sample = (
+        u'msgid ""\n'
+        u'msgstr ""\n'
+        u'"Content-Type: text/plain; charset=iso-8859-1\\n"\n'
+        u'\n'
+        u'msgid "foo"\n'
+        u'msgstr "café"\n'
+    )
+
+    def _save_to_string(self, po, encoding='utf-8'):
+        fd, tmpfile = tempfile.mkstemp()
+        os.close(fd)
+        try:
+            po.save(tmpfile)
+            with open(tmpfile, 'rb') as f:
+                data = f.read()
+            return data.decode(encoding)
+        finally:
+            os.remove(tmpfile)
+
+    def _diff_opcodes(self, original, modified):
+        """
+        Returns the non-equal opcodes between two texts.
+        """
+        matcher = difflib.SequenceMatcher(
+            None,
+            original.splitlines(True),
+            modified.splitlines(True)
+        )
+        return [op for op in matcher.get_opcodes() if op[0] != 'equal']
+
+    def test_roundtrip_byte_identical(self):
+        """
+        Parsing and saving without any modification must preserve the
+        file byte-identically, including manual wrapping, comments,
+        previous fields, obsolete entries and plural slots.
+        """
+        po = polib.pofile(self.sample, preserve_layout=True)
+        self.assertEqual(self._save_to_string(po), self.sample)
+
+    def test_roundtrip_bom_and_crlf(self):
+        """
+        BOM and CRLF newline style must be preserved byte-identically.
+        """
+        content = u('﻿') + self.sample.replace(u('\n'), u('\r\n'))
+        fd, tmpfile = tempfile.mkstemp()
+        os.close(fd)
+        try:
+            with open(tmpfile, 'wb') as f:
+                f.write(content.encode('utf-8'))
+            po = polib.pofile(tmpfile, preserve_layout=True)
+            po.save()
+            with open(tmpfile, 'rb') as f:
+                data = f.read()
+            self.assertEqual(data, content.encode('utf-8'))
+        finally:
+            os.remove(tmpfile)
+
+    def test_minimal_diff_msgstr_with_context(self):
+        """
+        Two entries share the same msgid with different msgctxt: only the
+        msgstr field of the modified entry may be rewritten.
+        """
+        po = polib.pofile(self.sample, preserve_layout=True)
+        entry = po.find('foo', msgctxt='menu')
+        entry.msgstr = 'changed'
+        modified = self._save_to_string(po)
+        opcodes = self._diff_opcodes(self.sample, modified)
+        self.assertEqual(len(opcodes), 1)
+        tag, i1, i2, j1, j2 = opcodes[0]
+        self.assertEqual(tag, 'replace')
+        self.assertEqual(self.sample.splitlines(True)[i1:i2],
+                         [u('msgstr "bar"\n')])
+        self.assertEqual(modified.splitlines(True)[j1:j2],
+                         [u('msgstr "changed"\n')])
+        # the other entry with the same msgid is left untouched
+        self.assertTrue(
+            u('msgstr "hand "\n"wrapped "\n"translation"\n') in modified)
+
+    def test_minimal_diff_handwrapped_msgstr(self):
+        """
+        Modifying a hand-wrapped msgstr only rewrites that field, the
+        hand-wrapping of other entries is preserved.
+        """
+        po = polib.pofile(self.sample, preserve_layout=True)
+        entry = po.find('foo', msgctxt='button')
+        entry.msgstr = 'short'
+        modified = self._save_to_string(po)
+        opcodes = self._diff_opcodes(self.sample, modified)
+        self.assertEqual(len(opcodes), 1)
+        tag, i1, i2, j1, j2 = opcodes[0]
+        self.assertEqual(tag, 'replace')
+        self.assertEqual(self.sample.splitlines(True)[i1:i2],
+                         [u('msgstr "hand "\n'),
+                          u('"wrapped "\n'),
+                          u('"translation"\n')])
+        self.assertEqual(modified.splitlines(True)[j1:j2],
+                         [u('msgstr "short"\n')])
+
+    def test_minimal_diff_flags(self):
+        """
+        Adding a flag only inserts the flags line, nothing else changes.
+        """
+        po = polib.pofile(self.sample, preserve_layout=True)
+        entry = po.find('foo', msgctxt='menu')
+        entry.flags = ['fuzzy']
+        modified = self._save_to_string(po)
+        opcodes = self._diff_opcodes(self.sample, modified)
+        self.assertEqual(len(opcodes), 1)
+        tag, i1, i2, j1, j2 = opcodes[0]
+        self.assertEqual(tag, 'insert')
+        self.assertEqual(modified.splitlines(True)[j1:j2],
+                         [u('#, fuzzy\n')])
+        # the flags line is inserted before the msgctxt of the entry
+        self.assertEqual(modified.splitlines(True)[j1 + 1],
+                         u('msgctxt "menu"\n'))
+
+    def test_minimal_diff_plural_slot(self):
+        """
+        Modifying one plural slot only rewrites that slot section.
+        """
+        po = polib.pofile(self.sample, preserve_layout=True)
+        entry = po.find('item')
+        entry.msgstr_plural[1] = 'lots'
+        modified = self._save_to_string(po)
+        opcodes = self._diff_opcodes(self.sample, modified)
+        self.assertEqual(len(opcodes), 1)
+        tag, i1, i2, j1, j2 = opcodes[0]
+        self.assertEqual(tag, 'replace')
+        self.assertEqual(self.sample.splitlines(True)[i1:i2],
+                         [u('msgstr[1] "many "\n'), u('"items"\n')])
+        self.assertEqual(modified.splitlines(True)[j1:j2],
+                         [u('msgstr[1] "lots"\n')])
+        # the other plural slot is preserved as-is
+        self.assertTrue(u('msgstr[0] "one item"\n') in modified)
+
+    def test_minimal_diff_obsolete_entry(self):
+        """
+        Modifying the msgstr of an obsolete entry only rewrites that
+        field, keeping the "#~ " prefix.
+        """
+        po = polib.pofile(self.sample, preserve_layout=True)
+        entry = po.obsolete_entries()[0]
+        entry.msgstr = 'new obsolete translation'
+        modified = self._save_to_string(po)
+        opcodes = self._diff_opcodes(self.sample, modified)
+        self.assertEqual(len(opcodes), 1)
+        tag, i1, i2, j1, j2 = opcodes[0]
+        self.assertEqual(tag, 'replace')
+        self.assertEqual(self.sample.splitlines(True)[i1:i2],
+                         [u('#~ msgstr "obsolete translation"\n')])
+        self.assertEqual(modified.splitlines(True)[j1:j2],
+                         [u('#~ msgstr "new obsolete translation"\n')])
+
+    def test_duplicate_msgids(self):
+        """
+        Entries are located by identity, not by msgid: modifying the
+        second of two duplicate entries leaves the first one untouched.
+        """
+        content = (
+            u'msgid "dup"\n'
+            u'msgstr "first"\n'
+            u'\n'
+            u'msgid "dup"\n'
+            u'msgstr "second"\n'
+        )
+        po = polib.pofile(content, preserve_layout=True)
+        po[1].msgstr = 'second changed'
+        modified = self._save_to_string(po)
+        opcodes = self._diff_opcodes(content, modified)
+        self.assertEqual(len(opcodes), 1)
+        tag, i1, i2, j1, j2 = opcodes[0]
+        self.assertEqual(content.splitlines(True)[i1:i2],
+                         [u('msgstr "second"\n')])
+        self.assertEqual(modified.splitlines(True)[j1:j2],
+                         [u('msgstr "second changed"\n')])
+
+    def test_insert_and_delete_entries(self):
+        """
+        Deleting and appending entries leaves the remaining entries
+        byte-identical.
+        """
+        po = polib.pofile(self.sample, preserve_layout=True)
+        entry = po.find('with previous')
+        po.remove(entry)
+        po.append(polib.POEntry(msgid='brand new', msgstr='nouveau'))
+        modified = self._save_to_string(po)
+        # the deleted entry is gone
+        self.assertFalse(u('msgid "with previous"') in modified)
+        # the new entry is rendered
+        self.assertTrue(
+            u('msgid "brand new"\nmsgstr "nouveau"\n') in modified)
+        # untouched entries are preserved byte-identically
+        self.assertTrue(
+            u('msgstr "hand "\n"wrapped "\n"translation"\n') in modified)
+        self.assertTrue(u('#~ msgstr "obsolete translation"\n') in modified)
+        self.assertTrue(u('# trailing comment\n') in modified)
+
+    def test_reparse_after_modification(self):
+        """
+        The saved file re-parses correctly and holds the modified values.
+        """
+        po = polib.pofile(self.sample, preserve_layout=True)
+        po.find('foo', msgctxt='menu').msgstr = 'changed'
+        po.find('item').msgstr_plural[0] = 'one thing'
+        fd, tmpfile = tempfile.mkstemp()
+        os.close(fd)
+        try:
+            po.save(tmpfile)
+            reparsed = polib.pofile(tmpfile)
+        finally:
+            os.remove(tmpfile)
+        self.assertEqual(reparsed.find('foo', msgctxt='menu').msgstr,
+                         'changed')
+        self.assertEqual(reparsed.find('foo', msgctxt='button').msgstr,
+                         'hand wrapped translation')
+        self.assertEqual(reparsed.find('item').msgstr_plural[0],
+                         'one thing')
+        self.assertEqual(reparsed.find('item').msgstr_plural[1],
+                         'many items')
+        previous = reparsed.find('with previous')
+        self.assertEqual(previous.previous_msgid, 'old foo')
+        self.assertEqual(previous.previous_msgctxt, 'old ctx')
+        self.assertEqual(len(reparsed.obsolete_entries()), 1)
+        self.assertEqual(reparsed.metadata['Project-Id-Version'],
+                         'sample 1.0')
+
+    def test_metadata_change(self):
+        """
+        Changing a metadata value only rewrites the metadata entry, the
+        rest of the file is preserved byte-identically.
+        """
+        po = polib.pofile(self.sample, preserve_layout=True)
+        po.metadata['Project-Id-Version'] = 'sample 2.0'
+        modified = self._save_to_string(po)
+        self.assertTrue(u('Project-Id-Version: sample 2.0\\n') in modified)
+        # everything after the metadata entry is byte-identical
+        marker = u('# translator comment')
+        self.assertEqual(modified.split(marker, 1)[1],
+                         self.sample.split(marker, 1)[1])
+
+    def test_encoding_error_raised_before_writing(self):
+        """
+        Content that cannot be encoded with the file encoding raises an
+        error before anything is written to the file.
+        """
+        po = polib.pofile(self.latin1_sample, preserve_layout=True)
+        self.assertEqual(po.encoding, 'iso-8859-1')
+        po[0].msgstr = u('中文')
+        fd, tmpfile = tempfile.mkstemp()
+        try:
+            os.write(fd, b'sentinel')
+            os.close(fd)
+            self.assertRaises(UnicodeEncodeError, po.save, tmpfile)
+            with open(tmpfile, 'rb') as f:
+                self.assertEqual(f.read(), b'sentinel')
+        finally:
+            os.remove(tmpfile)
+
+    def test_charset_change_requires_explicit_reencode(self):
+        """
+        Changing the charset in the metadata requires an explicit change
+        of the file encoding, so the whole file is re-encoded and never
+        mixes encodings.
+        """
+        po = polib.pofile(self.latin1_sample, preserve_layout=True)
+        po.metadata['Content-Type'] = 'text/plain; charset=utf-8'
+        # the metadata charset was changed but not the file encoding
+        self.assertRaises(ValueError, self._save_to_string, po,
+                          'iso-8859-1')
+        # explicitly setting the encoding re-encodes the whole file
+        po.encoding = 'utf-8'
+        modified = self._save_to_string(po, 'utf-8')
+        self.assertTrue(u('charset=utf-8') in modified)
+        self.assertTrue(u('msgstr "café"') in modified)
+
+    def test_roundtrip_existing_po_files(self):
+        """
+        The sample po files of the test suite (which include unusual
+        metadata formatting, empty comment lines and metadata entries in
+        unusual locations) must be preserved byte-identically when parsed
+        and saved without modification.
+        """
+        paths = sorted(glob.glob('tests/*.po'))
+        paths += sorted(glob.glob('tests/*.pot'))
+        self.assertTrue(len(paths) > 0)
+        for path in paths:
+            try:
+                po = polib.pofile(path, preserve_layout=True)
+            except (IOError, UnicodeDecodeError):
+                continue  # files that are invalid on purpose
+            fd, tmpfile = tempfile.mkstemp()
+            os.close(fd)
+            try:
+                po.save(tmpfile)
+                with open(path, 'rb') as f:
+                    original = f.read()
+                with open(tmpfile, 'rb') as f:
+                    saved = f.read()
+                self.assertEqual(saved, original,
+                                 'file %s was not preserved' % path)
+            finally:
+                os.remove(tmpfile)
+
+    def test_singular_to_plural_switch(self):
+        """
+        Switching an entry from singular to plural drops the msgstr
+        section and inserts the msgid_plural/msgstr_plural sections.
+        """
+        content = (
+            u'msgid "foo"\n'
+            u'msgstr "bar"\n'
+        )
+        po = polib.pofile(content, preserve_layout=True)
+        entry = po[0]
+        entry.msgid_plural = 'foos'
+        entry.msgstr_plural = {0: 'one', 1: 'many'}
+        modified = self._save_to_string(po)
+        self.assertFalse(u'msgstr "bar"' in modified)
+        self.assertTrue(u'msgid_plural "foos"\n' in modified)
+        self.assertTrue(u'msgstr[0] "one"\n' in modified)
+        self.assertTrue(u'msgstr[1] "many"\n' in modified)
+        # the modified entry re-parses correctly
+        fd, tmpfile = tempfile.mkstemp()
+        os.close(fd)
+        try:
+            po.save(tmpfile)
+            reparsed = polib.pofile(tmpfile)
+        finally:
+            os.remove(tmpfile)
+        self.assertEqual(reparsed[0].msgid_plural, 'foos')
+        self.assertEqual(reparsed[0].msgstr_plural[1], 'many')
 
 
 if __name__ == '__main__':

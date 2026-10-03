@@ -73,7 +73,8 @@ def _pofile_or_mofile(f, type, **kwargs):
         f,
         encoding=enc,
         check_for_duplicates=kwargs.get('check_for_duplicates', False),
-        klass=kwargs.get('klass')
+        klass=kwargs.get('klass'),
+        preserve_layout=kwargs.get('preserve_layout', False)
     )
     instance = parser.parse()
     instance.wrapwidth = kwargs.get('wrapwidth', 78)
@@ -126,6 +127,14 @@ def pofile(pofile, **kwargs):
         class which is used to instantiate the return value (optional,
         default: ``None``, the return value with be a :class:`~polib.POFile`
         instance).
+
+    ``preserve_layout``
+        boolean, whether to preserve the original file layout (optional,
+        default: ``False``). When enabled, the lexical sections of the
+        source file (comments, fields, blank lines, ...) are recorded at
+        parse time and :meth:`~polib.POFile.save` only rewrites the fields
+        that were actually modified, keeping every other section
+        byte-identical (including BOM and newline style).
     """
     return _pofile_or_mofile(pofile, 'pofile', **kwargs)
 # }}}
@@ -288,6 +297,32 @@ def natural_sort(lst):
     return sorted(lst, key=alphanum_key)
 
 # }}}
+# function _charset_from_metadata() {{{
+
+
+def _charset_from_metadata(metadata):
+    """
+    Returns the charset declared in the ``Content-Type`` metadata entry,
+    or ``None`` if there is none.
+    """
+    match = re.search(r'charset=([\w_\-:\.]+)', metadata.get('Content-Type',
+                                                             ''))
+    if match:
+        return match.group(1).strip()
+    return None
+# }}}
+# function _same_charset() {{{
+
+
+def _same_charset(charset1, charset2):
+    """
+    Returns ``True`` if both charset names designate the same codec.
+    """
+    try:
+        return codecs.lookup(charset1) == codecs.lookup(charset2)
+    except LookupError:
+        return charset1.lower() == charset2.lower()
+# }}}
 # class _BaseFile {{{
 
 
@@ -448,13 +483,28 @@ class _BaseFile(list):
         """
         if self.fpath is None and fpath is None:
             raise IOError('You must provide a file path to save() method')
-        contents = getattr(self, repr_method)()
         if fpath is None:
             fpath = self.fpath
-        if repr_method == 'to_binary':
+        if repr_method == '__unicode__' and \
+                getattr(self, '_preserve_layout', False):
+            # layout preservation mode: unmodified lexical sections are
+            # kept byte-identical and only modified fields are rewritten.
+            # The whole content is encoded upfront so that encoding errors
+            # are raised *before* anything is written to the file, and the
+            # file can never end up mixing several encodings.
+            self._check_layout_charset()
+            contents = self._preserved_unicode()
+            # encode upfront: an encoding error must be raised before the
+            # file is truncated
+            contents = contents.encode(self.encoding)
+            with open(fpath, 'wb') as fhandle:
+                fhandle.write(contents)
+        elif repr_method == 'to_binary':
+            contents = getattr(self, repr_method)()
             with open(fpath, 'wb') as fhandle:
                 fhandle.write(contents)
         else:
+            contents = getattr(self, repr_method)()
             with io.open(
                 fpath,
                 'w',
@@ -655,19 +705,29 @@ class POFile(_BaseFile):
         """
         Returns the unicode representation of the po file.
         """
-        ret, headers = '', self.header.split('\n')
-        for header in headers:
-            if not len(header):
-                ret += "#\n"
-            elif header[:1] in [',', ':']:
-                ret += '#%s\n' % header
-            else:
-                ret += '# %s\n' % header
+        ret = u('\n').join(self._header_lines())
+        if ret:
+            ret += u('\n')
 
         if not isinstance(ret, text_type):
             ret = ret.decode(self.encoding)
 
         return ret + _BaseFile.__unicode__(self)
+
+    def _header_lines(self):
+        """
+        Returns the file header as a list of comment lines (without line
+        endings).
+        """
+        ret = []
+        for header in self.header.split('\n'):
+            if not len(header):
+                ret.append('#')
+            elif header[:1] in [',', ':']:
+                ret.append('#%s' % header)
+            else:
+                ret.append('# %s' % header)
+        return ret
 
     def save_as_mofile(self, fpath):
         """
@@ -748,6 +808,290 @@ class POFile(_BaseFile):
         for entry in self:
             if entry.msgid_with_context not in refpot_msgids:
                 entry.obsolete = True
+
+    # layout preservation (preserve_layout mode) {{{
+
+    # canonical order of the entry fields, used to position regenerated
+    # or newly added sections
+    _layout_field_order = [
+        'tcomment', 'comment', 'occurrences', 'flags',
+        'previous_msgctxt', 'previous_msgid', 'previous_msgid_plural',
+        'msgctxt', 'msgid', 'msgid_plural', 'msgstr_plural', 'msgstr'
+    ]
+
+    def _check_layout_charset(self):
+        """
+        Ensures that a charset change in the metadata is matched by an
+        explicit change of the file ``encoding`` attribute, so that the
+        whole file is re-encoded consistently and never mixes several
+        encodings.
+        """
+        current = _charset_from_metadata(self.metadata)
+        if current is None or current == self._layout_parsed_charset:
+            return
+        if _same_charset(current, self.encoding):
+            return
+        raise ValueError(
+            'the metadata charset was changed to %r but the file encoding '
+            'is %r: set the "encoding" attribute to %r to re-encode the '
+            'whole file' % (current, self.encoding, current)
+        )
+
+    def _preserved_unicode(self):
+        """
+        Returns the unicode representation of the po file, preserving the
+        recorded source layout: unmodified lexical sections are emitted
+        verbatim and only modified fields are regenerated.
+        """
+        newline = self._layout_newline or u('\n')
+        chunks = []
+        # file header (leading comments and blank lines)
+        if self.header == self._layout_header_text:
+            chunks.extend(self._layout_header)
+        else:
+            chunks.extend(line + newline for line in self._header_lines())
+        # entries, with the metadata entry back at its original position
+        metadata_entry = self._layout_metadata_entry
+        entries = list(self)
+        if metadata_entry is not None:
+            index = min(self._layout_metadata_index, len(entries))
+            entries.insert(index, metadata_entry)
+        elif self.metadata or self.metadata_is_fuzzy:
+            # no metadata entry in the original file, but metadata has
+            # been set afterwards: generate a brand new metadata entry
+            chunks.append(self._convert_newlines(
+                self.metadata_as_entry().__unicode__(self.wrapwidth),
+                newline))
+        for entry in entries:
+            if entry is metadata_entry:
+                chunks.extend(self._render_layout_metadata(newline))
+            else:
+                chunks.extend(self._render_layout_entry(entry, entry,
+                                                        newline))
+        # trailing lines (comments or blank lines after the last entry)
+        chunks.extend(self._layout_trailing)
+        ret = u('').join(chunks)
+        if self._layout_bom:
+            ret = codecs.BOM_UTF8.decode('utf-8') + ret
+        return ret
+
+    def _render_layout_metadata(self, newline):
+        """
+        Renders the metadata entry: kept byte-identical when the metadata
+        dict and the fuzzy flag are untouched, fully regenerated from the
+        current metadata otherwise.
+        """
+        snapshot = self._layout_metadata_snapshot
+        if snapshot is not None and \
+                self.metadata == snapshot[0] and \
+                bool(self.metadata_is_fuzzy) == snapshot[1]:
+            return [raw for _name, raw in
+                    self._layout_metadata_entry._layout]
+        return [self._convert_newlines(
+            self.metadata_as_entry().__unicode__(self.wrapwidth), newline)]
+
+    @staticmethod
+    def _convert_newlines(text, newline):
+        if newline != u('\n'):
+            text = text.replace(u('\n'), newline)
+        return text
+
+    def _render_layout_entry(self, layout_entry, current_entry, newline):
+        """
+        Renders one entry as a list of chunks (lines with their endings).
+        ``layout_entry`` carries the recorded source layout and snapshot,
+        while ``current_entry`` carries the values to write (both are the
+        same object for regular entries).
+        """
+        wrapwidth = self.wrapwidth
+        layout = getattr(layout_entry, '_layout', None)
+        snapshot = getattr(layout_entry, '_layout_snapshot', None)
+        if layout is None or snapshot is None:
+            # entry has no recorded layout (e.g. added by the user)
+            return [self._convert_newlines(
+                current_entry.__unicode__(wrapwidth), newline)]
+        # Fall back to a full regeneration of the entry when the obsolete
+        # flag changed (every line prefix changes), or when fields that
+        # are not emitted for obsolete entries were modified.
+        full_regen = current_entry.obsolete != snapshot['obsolete']
+        if current_entry.obsolete:
+            full_regen = full_regen or \
+                current_entry.comment != snapshot['comment'] or \
+                current_entry.occurrences != snapshot['occurrences']
+        if full_regen:
+            return [self._convert_newlines(
+                current_entry.__unicode__(wrapwidth), newline)]
+        # assign a sort key to each recorded section: field sections get
+        # their canonical position, blank/verbatim sections get the key of
+        # the next field section (or a trailing key)
+        order = self._layout_field_order
+        keys = []
+        next_key = len(order) + 1
+        for name, _raw in reversed(layout):
+            if name in ('blank', 'verbatim'):
+                keys.append(next_key)
+            else:
+                next_key = order.index(self._layout_field_base(name)[0])
+                keys.append(next_key)
+        keys.reverse()
+        groups = []
+        seen = set()
+        done = set()
+        for (name, raw), key in zip(layout, keys):
+            if name in ('blank', 'verbatim'):
+                groups.append((key, [raw]))
+                continue
+            seen.add(name)
+            if name in done:
+                # remaining raw lines of an already handled field
+                continue
+            base = self._layout_field_base(name)[0]
+            present = self._layout_field_present(current_entry, name)
+            current_value = self._layout_field_value(current_entry, name)
+            unchanged = current_value == self._layout_snapshot_value(
+                snapshot, name)
+            if base in ('msgstr', 'msgstr_plural'):
+                # structural fields: their presence depends on each other
+                # (an entry is either singular or plural), so the presence
+                # check must win over the (un)changed check
+                if not present:
+                    # the field was removed: drop the whole section
+                    done.add(name)
+                    continue
+                if unchanged:
+                    # unmodified field: keep the raw source line
+                    groups.append((key, [raw]))
+                    continue
+            elif unchanged:
+                # unmodified field: keep the raw source line, even if the
+                # field parses to an empty value (e.g. an empty "#"
+                # comment line)
+                groups.append((key, [raw]))
+                continue
+            elif not present:
+                # the field was removed: drop the whole section
+                done.add(name)
+                continue
+            # modified field: regenerate only this field
+            lines = self._layout_field_lines(current_entry, name,
+                                             wrapwidth)
+            groups.append((key, [line + newline for line in lines]))
+            done.add(name)
+        # fields that are present now but had no section in the original
+        # entry (e.g. a msgctxt or flags added by the user)
+        for name in self._layout_entry_fields(current_entry):
+            if name in seen or \
+                    not self._layout_field_present(current_entry, name):
+                continue
+            key = order.index(self._layout_field_base(name)[0])
+            lines = self._layout_field_lines(current_entry, name, wrapwidth)
+            group = (key, [line + newline for line in lines])
+            position = len(groups)
+            for i, (k, _chunks) in enumerate(groups):
+                if k > key:
+                    position = i
+                    break
+            groups.insert(position, group)
+        chunks = []
+        for _key, group_chunks in groups:
+            chunks.extend(group_chunks)
+        return chunks
+
+    @staticmethod
+    def _layout_field_base(name):
+        """
+        Returns a ``(base_name, plural_index)`` tuple for a layout section
+        name (``plural_index`` is ``None`` for non-plural fields).
+        """
+        if '[' in name:
+            base = name[:name.index('[')]
+            index = int(name[name.index('[') + 1:name.index(']')])
+            return base, index
+        return name, None
+
+    @staticmethod
+    def _layout_field_present(entry, name):
+        """
+        Returns ``True`` if the given field would be emitted for ``entry``.
+        """
+        base, index = POFile._layout_field_base(name)
+        if base == 'tcomment':
+            return bool(entry.tcomment)
+        if base == 'comment':
+            return bool(entry.comment) and not entry.obsolete
+        if base == 'occurrences':
+            return bool(entry.occurrences) and not entry.obsolete
+        if base == 'flags':
+            return bool(entry.flags)
+        if base in ('previous_msgctxt', 'previous_msgid',
+                    'previous_msgid_plural'):
+            return getattr(entry, base) is not None
+        if base == 'msgctxt':
+            return entry.msgctxt is not None
+        if base == 'msgid':
+            return True
+        if base == 'msgid_plural':
+            return bool(entry.msgid_plural)
+        if base == 'msgstr_plural':
+            return bool(entry.msgstr_plural) and \
+                index in entry.msgstr_plural
+        # msgstr
+        return not entry.msgstr_plural
+
+    @staticmethod
+    def _layout_field_value(entry, name):
+        base, index = POFile._layout_field_base(name)
+        if base == 'msgstr_plural':
+            return entry.msgstr_plural.get(index)
+        return getattr(entry, base)
+
+    @staticmethod
+    def _layout_snapshot_value(snapshot, name):
+        base, index = POFile._layout_field_base(name)
+        if base == 'msgstr_plural':
+            return snapshot['msgstr_plural'].get(index)
+        return snapshot[base]
+
+    @staticmethod
+    def _layout_entry_fields(entry):
+        """
+        Returns the field names of ``entry``, in canonical order.
+        """
+        names = ['tcomment', 'comment', 'occurrences', 'flags',
+                 'previous_msgctxt', 'previous_msgid',
+                 'previous_msgid_plural', 'msgctxt', 'msgid',
+                 'msgid_plural']
+        names += ['msgstr_plural[%s]' % index
+                  for index in sorted(entry.msgstr_plural)]
+        names.append('msgstr')
+        return names
+
+    @staticmethod
+    def _layout_field_lines(entry, name, wrapwidth):
+        """
+        Regenerates the lines (without line endings) of a single entry
+        field, using the standard polib escaping and wrapping rules.
+        """
+        base, index = POFile._layout_field_base(name)
+        delflag = '#~ ' if entry.obsolete else ''
+        if base == 'tcomment':
+            return entry._wrap_comment('# ', entry.tcomment, wrapwidth)
+        if base == 'comment':
+            return entry._wrap_comment('#. ', entry.comment, wrapwidth)
+        if base == 'occurrences':
+            return entry._occurrence_lines(wrapwidth)
+        if base == 'flags':
+            return ['#, %s' % ', '.join(entry.flags)]
+        if base.startswith('previous_'):
+            prefix = '#~| ' if entry.obsolete else '#| '
+            return entry._str_field(base, prefix, '', getattr(entry, base),
+                                    wrapwidth)
+        if base == 'msgstr_plural':
+            return entry._str_field('msgstr', delflag, '[%s]' % index,
+                                    entry.msgstr_plural[index], wrapwidth)
+        return entry._str_field(base, delflag, '', getattr(entry, base),
+                                wrapwidth)
+    # }}}
 # }}}
 # class MOFile {{{
 
@@ -1014,22 +1358,60 @@ class POEntry(_BaseEntry):
         else:
             comments = [('tcomment', '# '), ('comment', '#. ')]
         for c in comments:
-            val = getattr(self, c[0])
-            if val:
-                for comment in val.split('\n'):
-                    if wrapwidth > 0 and len(comment) + len(c[1]) > wrapwidth:
-                        ret += textwrap.wrap(
-                            comment,
-                            wrapwidth,
-                            initial_indent=c[1],
-                            subsequent_indent=c[1],
-                            break_long_words=False
-                        )
-                    else:
-                        ret.append('%s%s' % (c[1], comment))
+            ret += self._wrap_comment(c[1], getattr(self, c[0]), wrapwidth)
 
         # occurrences (with text wrapping as xgettext does)
-        if not self.obsolete and self.occurrences:
+        if not self.obsolete:
+            ret += self._occurrence_lines(wrapwidth)
+
+        # flags (TODO: wrapping ?)
+        if self.flags:
+            ret.append('#, %s' % ', '.join(self.flags))
+
+        # previous context and previous msgid/msgid_plural
+        fields = ['previous_msgctxt', 'previous_msgid',
+                  'previous_msgid_plural']
+        if self.obsolete:
+            prefix = "#~| "
+        else:
+            prefix = "#| "
+        for f in fields:
+            val = getattr(self, f)
+            if val is not None:
+                ret += self._str_field(f, prefix, "", val, wrapwidth)
+
+        ret.append(_BaseEntry.__unicode__(self, wrapwidth))
+        ret = u('\n').join(ret)
+        return ret
+
+    @staticmethod
+    def _wrap_comment(prefix, text, wrapwidth):
+        """
+        Returns the comment lines for the given ``text``, prefixed with
+        ``prefix`` and wrapped the way xgettext does.
+        """
+        ret = []
+        if text:
+            for comment in text.split('\n'):
+                if wrapwidth > 0 and len(comment) + len(prefix) > wrapwidth:
+                    ret += textwrap.wrap(
+                        comment,
+                        wrapwidth,
+                        initial_indent=prefix,
+                        subsequent_indent=prefix,
+                        break_long_words=False
+                    )
+                else:
+                    ret.append('%s%s' % (prefix, comment))
+        return ret
+
+    def _occurrence_lines(self, wrapwidth):
+        """
+        Returns the occurrence lines of the entry, wrapped the way
+        xgettext does.
+        """
+        ret = []
+        if self.occurrences:
             filelist = []
             for fpath, lineno in self.occurrences:
                 if lineno:
@@ -1051,25 +1433,6 @@ class POEntry(_BaseEntry):
                 )]
             else:
                 ret.append('#: ' + filestr)
-
-        # flags (TODO: wrapping ?)
-        if self.flags:
-            ret.append('#, %s' % ', '.join(self.flags))
-
-        # previous context and previous msgid/msgid_plural
-        fields = ['previous_msgctxt', 'previous_msgid',
-                  'previous_msgid_plural']
-        if self.obsolete:
-            prefix = "#~| "
-        else:
-            prefix = "#| "
-        for f in fields:
-            val = getattr(self, f)
-            if val is not None:
-                ret += self._str_field(f, prefix, "", val, wrapwidth)
-
-        ret.append(_BaseEntry.__unicode__(self, wrapwidth))
-        ret = u('\n').join(ret)
         return ret
 
     def __cmp__(self, other):
@@ -1263,16 +1626,30 @@ class _POFileParser(object):
         ``check_for_duplicates``
             whether to check for duplicate entries when adding entries to the
             file (optional, default: ``False``).
+
+        ``preserve_layout``
+            whether to record the lexical sections of the source file so
+            that unmodified sections can be saved back byte-identically
+            (optional, default: ``False``).
         """
         enc = kwargs.get('encoding', default_encoding)
+        self.preserve_layout = kwargs.get('preserve_layout', False)
         if _is_file(pofile):
+            # in preserve_layout mode, newline translation is disabled so
+            # that raw lines (and their endings) can be recorded
+            newline = '' if self.preserve_layout else None
             try:
-                self.fhandle = io.open(pofile, 'rt', encoding=enc)
+                self.fhandle = io.open(pofile, 'rt', encoding=enc,
+                                       newline=newline)
             except LookupError:
                 enc = default_encoding
-                self.fhandle = io.open(pofile, 'rt', encoding=enc)
+                self.fhandle = io.open(pofile, 'rt', encoding=enc,
+                                       newline=newline)
         else:
-            self.fhandle = pofile.splitlines()
+            if self.preserve_layout:
+                self.fhandle = pofile.splitlines(True)
+            else:
+                self.fhandle = pofile.splitlines()
 
         klass = kwargs.get('klass')
         if klass is None:
@@ -1282,11 +1659,26 @@ class _POFileParser(object):
             encoding=enc,
             check_for_duplicates=kwargs.get('check_for_duplicates', False)
         )
+        self.instance._preserve_layout = self.preserve_layout
+        if self.preserve_layout:
+            instance = self.instance
+            instance._layout_header = []
+            instance._layout_header_text = None
+            instance._layout_trailing = []
+            instance._layout_bom = False
+            instance._layout_newline = None
+            instance._layout_metadata_entry = None
+            instance._layout_metadata_index = None
+            instance._layout_metadata_snapshot = None
+            instance._layout_parsed_charset = None
         self.transitions = {}
         self.current_line = 0
         self.current_entry = POEntry(linenum=self.current_line)
         self.current_state = 'st'
         self.current_token = None
+        # memo attributes used when preserve_layout is enabled
+        self._raw_line = None
+        self._layout_current_section = None
         # two memo flags used in handlers
         self.msgstr_index = 0
         self.entry_obsolete = 0
@@ -1349,18 +1741,29 @@ class _POFileParser(object):
             fpath = '%s ' % self.instance.fpath if self.instance.fpath else ''
             for line in self.fhandle:
                 self.current_line += 1
+                raw_line = line
                 if self.current_line == 1:
                     BOM = codecs.BOM_UTF8.decode('utf-8')
                     if line.startswith(BOM):
                         line = line[len(BOM):]
+                        raw_line = line
+                        if self.preserve_layout:
+                            self.instance._layout_bom = True
+                if self.preserve_layout:
+                    self._raw_line = raw_line
+                    self._detect_layout_newline(raw_line)
                 line = line.strip()
                 if line == '':
+                    if self.preserve_layout:
+                        self._record_layout_blank(raw_line)
                     continue
 
                 tokens = line.split(None, 2)
                 nb_tokens = len(tokens)
 
                 if tokens[0] == '#~|':
+                    if self.preserve_layout:
+                        self._record_layout_verbatim(raw_line)
                     continue
 
                 if tokens[0] == '#~' and nb_tokens > 1:
@@ -1391,6 +1794,8 @@ class _POFileParser(object):
 
                 if tokens[0] == '#:':
                     if nb_tokens <= 1:
+                        if self.preserve_layout:
+                            self._record_layout_verbatim(raw_line)
                         continue
                     # we are on a occurrences line
                     self.process('oc')
@@ -1413,6 +1818,8 @@ class _POFileParser(object):
 
                 elif tokens[0] == '#,':
                     if nb_tokens <= 1:
+                        if self.preserve_layout:
+                            self._record_layout_verbatim(raw_line)
                         continue
                     # we are on a flags line
                     self.process('fl')
@@ -1425,6 +1832,8 @@ class _POFileParser(object):
 
                 elif tokens[0] == '#.':
                     if nb_tokens <= 1:
+                        if self.preserve_layout:
+                            self._record_layout_verbatim(raw_line)
                         continue
                     # we are on a generated comment line
                     self.process('gc')
@@ -1473,11 +1882,28 @@ class _POFileParser(object):
                 # add the last entry here (only if there are lines). Trailing
                 # comments are ignored
                 self.instance.append(self.current_entry)
+                if self.preserve_layout:
+                    self._finalize_layout_entry(self.current_entry)
+            elif self.preserve_layout:
+                # keep the raw trailing lines (trailing comments and blank
+                # lines after the last entry) so they can be saved back
+                trailing = getattr(self.current_entry, '_layout', None)
+                if trailing:
+                    self.instance._layout_trailing = [raw for _name, raw in
+                                                      trailing]
 
             # before returning the instance, check if there's metadata and if
             # so extract it in a dict
             metadataentry = self.instance.find('')
             if metadataentry:  # metadata found
+                if self.preserve_layout:
+                    # keep the metadata entry (and its original position)
+                    # so it can be rendered back at the same place
+                    for index, entry in enumerate(self.instance):
+                        if entry is metadataentry:
+                            self.instance._layout_metadata_index = index
+                            break
+                    self.instance._layout_metadata_entry = metadataentry
                 # remove the entry
                 self.instance.remove(metadataentry)
                 self.instance.metadata_is_fuzzy = metadataentry.flags
@@ -1489,6 +1915,14 @@ class _POFileParser(object):
                     except (ValueError, KeyError):
                         if key is not None:
                             self.instance.metadata[key] += '\n' + msg.strip()
+            if self.preserve_layout:
+                self.instance._layout_header_text = self.instance.header
+                self.instance._layout_metadata_snapshot = (
+                    dict(self.instance.metadata),
+                    bool(self.instance.metadata_is_fuzzy)
+                )
+                self.instance._layout_parsed_charset = \
+                    _charset_from_metadata(self.instance.metadata)
         finally:
             # close opened file
             if not isinstance(self.fhandle, list):  # must be file
@@ -1529,14 +1963,124 @@ class _POFileParser(object):
         """
         try:
             (action, state) = self.transitions[(symbol, self.current_state)]
+            previous_entry = self.current_entry
             if action():
                 self.current_state = state
+                section = state
+            else:
+                # continuation line: the section does not change
+                section = None
+            if self.preserve_layout:
+                if self.current_entry is not previous_entry:
+                    # a new entry was started by the handler: the previous
+                    # one is complete, snapshot its field values
+                    self._finalize_layout_entry(previous_entry)
+                self._record_layout_line(section)
         except Exception:
             fpath = '%s ' % self.instance.fpath if self.instance.fpath else ''
             if hasattr(self.fhandle, 'close'):
                 self.fhandle.close()
             raise IOError('Syntax error in po file %s(line %s)' %
                           (fpath, self.current_line))
+
+    # layout preservation helpers (used when preserve_layout is enabled)
+
+    # mapping of parser states to layout section names
+    _layout_state_sections = {
+        'he': 'header',
+        'tc': 'tcomment',
+        'gc': 'comment',
+        'oc': 'occurrences',
+        'fl': 'flags',
+        'pc': 'previous_msgctxt',
+        'pm': 'previous_msgid',
+        'pp': 'previous_msgid_plural',
+        'ct': 'msgctxt',
+        'mi': 'msgid',
+        'mp': 'msgid_plural',
+        'ms': 'msgstr',
+        'mx': 'msgstr_plural',
+    }
+
+    def _detect_layout_newline(self, raw_line):
+        """
+        Detects the newline style of the file from its raw lines.
+        """
+        instance = self.instance
+        if instance._layout_newline is not None:
+            return
+        if raw_line.endswith('\r\n'):
+            instance._layout_newline = '\r\n'
+        elif raw_line.endswith('\n'):
+            instance._layout_newline = '\n'
+        elif raw_line.endswith('\r'):
+            instance._layout_newline = '\r'
+
+    def _entry_layout(self):
+        """
+        Returns the layout section list of the entry being parsed.
+        """
+        layout = getattr(self.current_entry, '_layout', None)
+        if layout is None:
+            layout = self.current_entry._layout = []
+        return layout
+
+    def _record_layout_blank(self, raw_line):
+        """
+        Records a blank line: blank lines that appear before the first
+        entry token are part of the file header block, other blank lines
+        belong to the entry currently being parsed.
+        """
+        if self.current_state in ('st', 'he') and \
+                not getattr(self.current_entry, '_layout', None):
+            self.instance._layout_header.append(raw_line)
+        else:
+            self._entry_layout().append(('blank', raw_line))
+
+    def _record_layout_verbatim(self, raw_line):
+        """
+        Records a line that is not parsed but must be preserved as-is.
+        """
+        self._entry_layout().append(('verbatim', raw_line))
+
+    def _record_layout_line(self, section):
+        """
+        Records the raw line that was just processed, associating it with
+        the lexical section it belongs to.
+        """
+        if section is None:
+            # continuation line: belongs to the section being recorded
+            name = self._layout_current_section
+        else:
+            name = self._layout_state_sections[section]
+            if name == 'msgstr_plural':
+                name = 'msgstr_plural[%s]' % self.msgstr_index
+            self._layout_current_section = name
+        if name == 'header':
+            self.instance._layout_header.append(self._raw_line)
+        else:
+            self._entry_layout().append((name, self._raw_line))
+
+    def _finalize_layout_entry(self, entry):
+        """
+        Snapshots the field values of a fully parsed entry, so that
+        modifications can be detected at save time.
+        """
+        entry._layout_snapshot = {
+            'msgid': entry.msgid,
+            'msgstr': entry.msgstr,
+            'msgid_plural': entry.msgid_plural,
+            'msgstr_plural': dict(entry.msgstr_plural),
+            'msgctxt': entry.msgctxt,
+            'obsolete': entry.obsolete,
+            'comment': entry.comment,
+            'tcomment': entry.tcomment,
+            'occurrences': list(entry.occurrences),
+            'flags': list(entry.flags),
+            'previous_msgctxt': entry.previous_msgctxt,
+            'previous_msgid': entry.previous_msgid,
+            'previous_msgid_plural': entry.previous_msgid_plural,
+        }
 
     # state handlers
 
