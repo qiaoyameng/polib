@@ -2,7 +2,9 @@
 # -*- coding: utf-8 -*-
 
 import codecs
+import io
 import os
+import struct
 import subprocess
 import sys
 import tempfile
@@ -875,6 +877,338 @@ msgid "foo"
 msgstr "oof"
 ''')
         self.assertEqual(mo.__unicode__(), expected)
+
+
+class TestLazyMOFile(unittest.TestCase):
+    """
+    Tests for the read-only lazy mo view (LazyMOView / lazy_mofile).
+    """
+    def _catalog(self, n=32, charset='utf-8'):
+        po = polib.POFile()
+        po.metadata = {
+            'Content-Type': 'text/plain; charset=%s' % charset,
+            'Language': 'fr',
+        }
+        for i in range(n):
+            po.append(polib.POEntry(
+                msgid='message-%04d' % i,
+                msgstr='traduction-%04d' % i
+            ))
+        po.append(polib.POEntry(
+            msgid='one file', msgid_plural='many files',
+            msgstr_plural={0: 'un fichier', 1: 'plusieurs fichiers'}
+        ))
+        po.append(polib.POEntry(msgid='shared', msgstr='sans contexte'))
+        po.append(polib.POEntry(msgctxt='menu', msgid='shared',
+                                msgstr='avec contexte'))
+        return po
+
+    def _mo_bytes(self, po, big_endian=False):
+        data = po.to_binary()
+        if not big_endian:
+            return data
+        nstrings = struct.unpack('<I', data[8:12])[0]
+        # only the 7 word header and the index words are endian dependent,
+        # the string tables stay byte identical
+        word_area = 28 + nstrings * 16
+        swapped = bytearray()
+        for i in range(0, word_area, 4):
+            swapped += data[i:i + 4][::-1]
+        return bytes(swapped) + data[word_area:]
+
+    def _write(self, data):
+        fd, tmpfile = tempfile.mkstemp(suffix='.mo')
+        os.write(fd, data)
+        os.close(fd)
+        return tmpfile
+
+    def test_factory_and_basic_find(self):
+        for use_mmap in (True, False):
+            po = self._catalog()
+            path = self._write(self._mo_bytes(po))
+            try:
+                view = polib.lazy_mofile(path, use_mmap=use_mmap)
+                self.assertIsInstance(view, polib.LazyMOView)
+                # opening the view decodes no entry at all
+                self.assertEqual(view.decoded_entries, 0)
+                self.assertEqual(len(view), len(po))
+                self.assertEqual(view.metadata['Language'], 'fr')
+                self.assertEqual(view.find('message-0007').msgstr,
+                                 'traduction-0007')
+                self.assertEqual(view.decoded_entries, 1)
+                self.assertIsNone(view.find('does-not-exist'))
+                # a miss never decodes an entry
+                self.assertEqual(view.decoded_entries, 1)
+                view.close()
+            finally:
+                os.remove(path)
+
+    def test_both_endiannesses(self):
+        po = self._catalog()
+        for big_endian in (False, True):
+            data = self._mo_bytes(po, big_endian=big_endian)
+            view = polib.lazy_mofile(data)
+            self.assertEqual(view.magic_number,
+                             polib.MOFile.MAGIC_SWAPPED if big_endian
+                             else polib.MOFile.MAGIC)
+            self.assertEqual(view.find('message-0001').msgstr,
+                             'traduction-0001')
+            self.assertEqual(view.find('one file').msgstr_plural,
+                             {0: 'un fichier', 1: 'plusieurs fichiers'})
+            self.assertEqual(
+                view.find('shared', msgctxt='menu').msgstr,
+                'avec contexte'
+            )
+            self.assertEqual(view.find('shared').msgstr, 'sans contexte')
+            # full iteration equals the eager parser content
+            eager = polib.mofile(data)
+            self.assertEqual(
+                [e.msgid_with_context for e in view],
+                [e.msgid_with_context for e in eager]
+            )
+            view.close()
+
+    def test_context_and_plural_composite_keys(self):
+        po = self._catalog()
+        view = polib.lazy_mofile(self._mo_bytes(po))
+        self.assertEqual(view.find('shared', msgctxt='menu').msgstr,
+                         'avec contexte')
+        # the wrong context must not match
+        self.assertIsNone(view.find('shared', msgctxt='other'))
+        # no msgctxt argument returns the context free message
+        self.assertEqual(view.find('shared').msgstr, 'sans contexte')
+        plural = view.find('one file')
+        self.assertEqual(plural.msgid_plural, 'many files')
+        self.assertEqual(plural.msgstr_plural[1], 'plusieurs fichiers')
+        view.close()
+
+    def test_lazy_decode_count(self):
+        # laziness is verified structurally by counting decoded entries, not
+        # by measuring execution time
+        po = self._catalog(n=500)
+        path = self._write(self._mo_bytes(po))
+        try:
+            view = polib.lazy_mofile(path)
+            self.assertEqual(view.decoded_entries, 0)
+            view.find('message-0000')
+            view.find('message-0499')
+            view.find('missing')
+            self.assertEqual(view.decoded_entries, 2)
+            entries = list(view)
+            self.assertEqual(len(entries), len(po))
+            self.assertEqual(view.decoded_entries, 2 + len(po))
+            view.close()
+        finally:
+            os.remove(path)
+
+    def test_iteration_indexing_and_contains(self):
+        po = self._catalog()
+        view = polib.lazy_mofile(self._mo_bytes(po))
+        entries = list(view)
+        self.assertEqual(len(entries), len(view))
+        self.assertEqual(view[0].msgid_with_context,
+                         entries[0].msgid_with_context)
+        self.assertEqual(view[-1].msgid_with_context,
+                         entries[-1].msgid_with_context)
+        self.assertEqual(len(view[1:4]), 3)
+        self.assertIn(view.find('message-0003'), view)
+        self.assertNotIn(polib.MOEntry(msgid='nope'), view)
+        self.assertRaises(IndexError, view.__getitem__, len(po) + 10)
+        view.close()
+
+    def test_materialized_entry_survives_close(self):
+        po = self._catalog()
+        path = self._write(self._mo_bytes(po))
+        try:
+            view = polib.lazy_mofile(path)
+            entry = view.materialize(2)
+            self.assertIsInstance(entry, polib.MOEntry)
+            view.close()
+            # the materialized entry does not depend on the mapped source
+            self.assertEqual(entry.msgstr,
+                             'traduction-%04d' %
+                             int(entry.msgid.split('-')[1]))
+        finally:
+            os.remove(path)
+
+    def test_closed_view_fails_explicitly(self):
+        view = polib.lazy_mofile(self._mo_bytes(self._catalog()))
+        view.close()
+        self.assertTrue(view.closed)
+        self.assertRaises(ValueError, view.find, 'message-0000')
+        self.assertRaises(ValueError, len, view)
+        self.assertRaises(ValueError, list, view)
+        self.assertRaises(ValueError, view.materialize, 0)
+        # context manager closes the view too
+        with polib.lazy_mofile(self._mo_bytes(self._catalog())) as cm:
+            self.assertEqual(cm.find('message-0000').msgstr,
+                             'traduction-0000')
+        self.assertTrue(cm.closed)
+
+    def test_external_stream_not_closed(self):
+        stream = io.BytesIO(self._mo_bytes(self._catalog()))
+        view = polib.lazy_mofile(stream)
+        self.assertEqual(view.find('message-0001').msgstr, 'traduction-0001')
+        view.close()
+        self.assertFalse(stream.closed)
+
+    def test_charset_detected_from_header(self):
+        header = b'Content-Type: text/plain; charset=ISO-8859-15\n'
+        data = self._build_raw_mo(
+            [(b'cha\xeene', b'r\xe9ponse')], header=header
+        )
+        view = polib.lazy_mofile(data)
+        self.assertEqual(view.encoding.lower(), 'iso-8859-15')
+        entry = view.find('cha\u00eene')
+        self.assertEqual((entry.msgid, entry.msgstr),
+                         ('cha\u00eene', 'r\u00e9ponse'))
+        view.close()
+
+    def test_to_mofile_matches_eager_parser(self):
+        data = self._mo_bytes(self._catalog())
+        lazy = polib.lazy_mofile(data)
+        eager = polib.mofile(data)
+        self.assertEqual(str(lazy.to_mofile()), str(eager))
+        lazy.close()
+
+    def test_fixture_parity(self):
+        for fixture in ('tests/test_utf8.mo', 'tests/test_msgctxt.mo',
+                        'tests/test_no_header.mo',
+                        'tests/test_version_1.1.mo'):
+            eager = polib.mofile(fixture)
+            lazy = polib.lazy_mofile(fixture)
+            self.assertEqual(len(lazy), len(eager), fixture)
+            for entry in eager:
+                found = lazy.find(entry.msgid,
+                                  msgctxt=entry.msgctxt if entry.msgctxt
+                                  else False)
+                self.assertIsNotNone(found, (fixture, entry.msgid))
+                self.assertEqual(found.msgstr, entry.msgstr, fixture)
+                self.assertEqual(found.msgstr_plural, entry.msgstr_plural,
+                                 fixture)
+            lazy.close()
+
+    def test_corrupt_indexes_are_rejected(self):
+        data = self._mo_bytes(self._catalog())
+
+        def corrupt(words):
+            broken = bytearray(data)
+            for offset, value in words.items():
+                struct.pack_into('<I', broken, offset, value)
+            return bytes(broken)
+
+        # truncated file
+        self.assertRaises(IOError, polib.lazy_mofile, data[:20])
+        # bad magic
+        self.assertRaises(IOError, polib.lazy_mofile,
+                          corrupt({0: 0xdeadbeef}))
+        # unsupported major revision
+        self.assertRaises(IOError, polib.lazy_mofile, corrupt({4: 2 << 16}))
+        # overflowing number of strings
+        self.assertRaises(IOError, polib.lazy_mofile,
+                          corrupt({8: 0xffffffff}))
+        # index tables pointing outside the file
+        self.assertRaises(IOError, polib.lazy_mofile,
+                          corrupt({12: 0xfffffff0}))
+        self.assertRaises(IOError, polib.lazy_mofile,
+                          corrupt({16: 0xfffffff0}))
+        # the key index table overlapping the 28 bytes header
+        self.assertRaises(IOError, polib.lazy_mofile, corrupt({12: 0}))
+        # a corrupted string offset pointing outside the file (second entry
+        # of the key index table: offset word at 28 + 8 + 4)
+        self.assertRaises(IOError, polib.lazy_mofile,
+                          corrupt({28 + 8 + 4: 0xfffffff0}))
+
+    @staticmethod
+    def _build_raw_mo(entries, header=b'', little_endian=True):
+        entries = sorted(entries)
+        if header:
+            entries = [(b'', header)] + entries
+        n = len(entries)
+        prefix = '<' if little_endian else '>'
+        keystart = 28 + 16 * n
+        ids, values, offsets = b'', b'', []
+        for key, value in entries:
+            offsets.append((len(ids), len(key), len(values), len(value)))
+            ids += key + b'\0'
+            values += value + b'\0'
+        valuestart = keystart + len(ids)
+        key_words, value_words = [], []
+        for key_off, key_len, value_off, value_len in offsets:
+            key_words += [key_len, key_off + keystart]
+            value_words += [value_len, value_off + valuestart]
+        magic = polib.MOFile.MAGIC if little_endian \
+            else polib.MOFile.MAGIC_SWAPPED
+        out = struct.pack(prefix + 'IIIIIII', magic, 0, n, 28,
+                          28 + 8 * n, 0, 0)
+        out += struct.pack(prefix + '%dI' % (4 * n),
+                           *(key_words + value_words))
+        return out + ids + values
+
+    def test_mo_with_hash_table(self):
+        # real msgfmt output embeds an optional hash table; make sure the
+        # boundary checks do not reject the legitimate overlapping layout
+        for big_endian in (False, True):
+            prefix = '>' if big_endian else '<'
+            keys = [b'', b'apple', b'banana', b'cherry']
+            values = {
+                b'': b'Content-Type: text/plain; charset=utf-8\n',
+                b'apple': b'pomme',
+                b'banana': b'banane',
+                b'cherry': b'cerise',
+            }
+            n = len(keys)
+            hsize = 4
+            hashstart = 28 + 16 * n
+            ids_start = hashstart + 4 * hsize
+            ids, krecs = b'', []
+            for key in keys:
+                krecs.append((len(key), ids_start + len(ids)))
+                ids += key + b'\0'
+            vals_start = ids_start + len(ids)
+            strings, vrecs = b'', []
+            for key in keys:
+                value = values[key]
+                vrecs.append((len(value), vals_start + len(strings)))
+                strings += value + b'\0'
+
+            def hash_value(key):
+                h = 0
+                for byte in key:
+                    h = (h << 4) + byte
+                    g = h & 0xf0000000
+                    if g:
+                        h ^= g >> 16
+                    h &= ~g & 0xffffffff
+                return h % hsize
+
+            hashtable = [0] * hsize
+            for index, key in enumerate(keys):
+                if not key:
+                    continue
+                slot = hash_value(key)
+                while hashtable[slot]:
+                    slot = 0 if slot == hsize - 1 else slot + 1
+                hashtable[slot] = index + 1
+
+            magic = polib.MOFile.MAGIC
+            out = struct.pack(prefix + 'IIIIIII', magic, 0, n, 28,
+                              28 + 8 * n, hsize, hashstart)
+            records = []
+            for length, offset in krecs:
+                records += [length, offset]
+            for length, offset in vrecs:
+                records += [length, offset]
+            out += struct.pack(prefix + '%dI' % (4 * n), *records)
+            out += struct.pack(prefix + '%dI' % hsize, *hashtable)
+            out += ids + strings
+
+            view = polib.lazy_mofile(out)
+            self.assertEqual(view.find('apple').msgstr, 'pomme')
+            self.assertEqual(view.find('cherry').msgstr, 'cerise')
+            self.assertEqual(str(view.to_mofile()),
+                             str(polib.mofile(out)))
+            view.close()
 
 
 if __name__ == '__main__':

@@ -14,6 +14,7 @@ modify entries, comments or metadata, etc. or create new po files from scratch.
 
 import array
 import codecs
+import mmap
 import os
 import re
 import struct
@@ -25,7 +26,8 @@ import io
 __author__ = 'David Jean Louis <izimobil@gmail.com>'
 __version__ = '1.2.0'
 __all__ = ['pofile', 'POFile', 'POEntry', 'mofile', 'MOFile', 'MOEntry',
-           'default_encoding', 'escape', 'unescape', 'detect_encoding', ]
+           'lazy_mofile', 'LazyMOView', 'default_encoding', 'escape',
+           'unescape', 'detect_encoding', ]
 
 
 # the default encoding to use when encoding cannot be detected
@@ -1829,4 +1831,548 @@ class _MOFileParser(object):
         if len(tup) == 1:
             return tup[0]
         return tup
+# }}}
+
+# function lazy_mofile() {{{
+
+# regex used to extract the charset from the raw header entry metadata
+_MO_HEADER_CHARSET = re.compile(b(r'Content-Type:[^\n]*?charset=([\w_\-:.]+)'))
+
+
+def lazy_mofile(mofile, **kwargs):
+    """
+    Convenience function that returns a read-only, lazily decoded view of the
+    mo file ``mofile`` as a :class:`~polib.LazyMOView` instance.
+
+    Only the header and the index tables are read at open time; message
+    strings are fetched from the binary source (an ``mmap`` object or a
+    seekable binary stream) and decoded on demand, when an entry is looked up
+    or iterated.  The eager behavior of :func:`~polib.mofile` is left
+    untouched.
+
+    Arguments:
+
+    ``mofile``
+        string, full or relative path to the mo file, a bytes object holding
+        the content of the mo file, or a seekable binary file-like object.
+
+    ``encoding``
+        string, the encoding to use (e.g. "utf-8") (default: ``None``, the
+        encoding is auto-detected from the header entry metadata).
+
+    ``use_mmap``
+        boolean, whether to use ``mmap`` to map a file given by path into
+        memory (optional, default: ``True``). Set it to ``False`` to read the
+        file through a seekable binary stream instead.
+    """
+    return LazyMOView(mofile, **kwargs)
+# }}}
+# class _LazyMOSource {{{
+
+
+class _LazyMOSource(object):
+    """
+    Random-access binary source used by :class:`~polib.LazyMOView`.
+
+    The source is either an ``mmap`` object over a file given by path or a
+    seekable binary stream.  The class keeps track of the resources it has
+    opened itself so that :meth:`close` can release them; externally provided
+    streams are never closed by the view.
+    """
+
+    def __init__(self, source, use_mmap=True):
+        self._mmap = None
+        self._file = None
+        self._buffer = None
+        self._stream = None
+        self._owns = False
+        self._size = None
+
+        if isinstance(source, (bytes, bytearray, memoryview)):
+            # an in-memory copy of the mo content
+            self._buffer = memoryview(bytes(source))
+            self._size = len(self._buffer)
+        elif hasattr(source, 'seek') and hasattr(source, 'read'):
+            # an external seekable binary stream, the caller owns its lifecycle
+            self._stream = source
+            self._size = self._measure_stream(source)
+        else:
+            path = os.fspath(source)
+            self._file = open(path, 'rb')
+            self._owns = True
+            if use_mmap:
+                try:
+                    self._mmap = mmap.mmap(
+                        self._file.fileno(), 0, access=mmap.ACCESS_READ
+                    )
+                    self._size = self._mmap.size()
+                    return
+                except (ValueError, OSError):
+                    # empty file or unsupported filesystem, fall back to the
+                    # seekable file handle
+                    self._mmap = None
+            self._stream = self._file
+            self._size = self._measure_stream(self._file)
+
+    @staticmethod
+    def _measure_stream(stream):
+        stream.seek(0, 2)
+        size = stream.tell()
+        stream.seek(0)
+        return size
+
+    def __len__(self):
+        return self._size
+
+    def read_at(self, offset, length):
+        """
+        Return exactly ``length`` bytes starting at ``offset``.
+
+        The caller is expected to have validated the bounds against the size
+        of the source; an out of range read nevertheless raises ``IOError``
+        rather than returning truncated data.
+        """
+        if offset < 0 or length < 0 or offset + length > self._size:
+            raise IOError('Out of range read in mo file')
+        if self._buffer is not None:
+            return bytes(self._buffer[offset:offset + length])
+        if self._mmap is not None:
+            return self._mmap[offset:offset + length]
+        self._stream.seek(offset)
+        data = self._stream.read(length)
+        if len(data) != length:
+            raise IOError('Unexpected end of mo file')
+        return data
+
+    def close(self):
+        if self._mmap is not None:
+            try:
+                self._mmap.close()
+            except (ValueError, OSError):
+                pass
+            self._mmap = None
+        if self._owns and self._file is not None:
+            try:
+                self._file.close()
+            except (ValueError, OSError):
+                pass
+        self._file = None
+        self._stream = None
+        self._buffer = None
+# }}}
+# class LazyMOView {{{
+
+
+class LazyMOView(object):
+    """
+    Read-only, lazily decoded view of a binary mo file.
+
+    The index of original and translated strings is read once at open time
+    and every offset and length is validated against the size of the binary
+    source.  Entries are fetched and decoded only when :meth:`find` hits an
+    entry or when the view is iterated.  Materialized entries are regular
+    :class:`~polib.MOEntry` instances that do not reference the mapped source
+    and therefore keep working after the view has been closed.
+
+    Both little and big endian mo files are supported, as well as contextual
+    (``msgctxt``) and plural entries whose keys/values embed ``NUL`` bytes.
+    The charset is taken from the ``charset=`` declaration of the first
+    (header) entry metadata, falling back to ``encoding`` or
+    ``default_encoding``.
+    """
+
+    MAGIC = MOFile.MAGIC
+    MAGIC_SWAPPED = MOFile.MAGIC_SWAPPED
+
+    def __init__(self, mofile, encoding=None, use_mmap=True, **kwargs):
+        """
+        Constructor.
+
+        Keyword arguments:
+
+        ``mofile``
+            string, path to the mo file, bytes holding the mo content or a
+            seekable binary file-like object.
+
+        ``encoding``
+            string, the encoding to use, defaults to ``None`` (auto-detected
+            from the header metadata) and finally ``default_encoding``.
+
+        ``use_mmap``
+            boolean, use an ``mmap`` object for path based sources (optional,
+            default: ``True``).
+        """
+        self.fpath = mofile if _is_file(mofile) else None
+        self.magic_number = None
+        self.version = 0
+        self.metadata = {}
+        self.metadata_is_fuzzy = 0
+        self.encoding = encoding or default_encoding
+        self._encoding_explicit = encoding is not None
+        self.closed = False
+        # number of logical entries actually decoded from the source
+        self.decoded_entries = 0
+
+        self._source = _LazyMOSource(mofile, use_mmap=use_mmap)
+        # list of (key_length, key_offset, value_length, value_offset) for
+        # every entry, including the header entry at index 0 when present
+        self._descriptors = []
+        self._has_header = False
+        self._endian = '<'
+        self._load_index()
+        self._load_header()
+
+    def __del__(self):
+        # best effort release of mapped resources
+        source = getattr(self, '_source', None)
+        if source is not None:
+            try:
+                source.close()
+            except Exception:
+                pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
+
+    def __len__(self):
+        self._check_open()
+        return len(self._descriptors) - (1 if self._has_header else 0)
+
+    def __iter__(self):
+        self._check_open()
+        start = 1 if self._has_header else 0
+        for index in range(start, len(self._descriptors)):
+            yield self._materialize_abs(index)
+
+    def __contains__(self, entry):
+        self._check_open()
+        msgctxt = getattr(entry, 'msgctxt', None) or False
+        msgid = getattr(entry, 'msgid', entry)
+        return self.find(msgid, msgctxt=msgctxt) is not None
+
+    def __getitem__(self, index):
+        self._check_open()
+        start = 1 if self._has_header else 0
+        if isinstance(index, slice):
+            return [self._materialize_abs(start + logical)
+                    for logical in range(*index.indices(len(self)))]
+        count = len(self)
+        if index < 0:
+            index += count
+        if index < 0 or index >= count:
+            raise IndexError('entry index out of range')
+        return self._materialize_abs(start + index)
+
+    # -- public API -------------------------------------------------------
+
+    def close(self):
+        """
+        Close the view and release the mapped source or any file handle the
+        view opened.  Accessing the view after it has been closed raises a
+        ``ValueError``.  Externally provided streams are not closed.
+        """
+        if not self.closed:
+            self.closed = True
+            self._source.close()
+
+    def find(self, st, by='msgid', include_obsolete_entries=False,
+             msgctxt=False):
+        """
+        Lazily find an entry, mirroring :meth:`_BaseFile.find`.
+
+        Lookup by ``msgid`` (the default) uses a binary search over the raw
+        keys of the mo index so only the matching entry, if any, is decoded.
+        Searching by any other property falls back to a sequential scan that
+        materializes the scanned entries.
+        """
+        self._check_open()
+        if by == 'msgid':
+            index = self._find_index(st, msgctxt)
+            if index is not None:
+                return self._materialize_abs(index)
+            return None
+        # generic fallback: decode only entries inspected by the scan
+        for entry in self:
+            if getattr(entry, by) == st:
+                if msgctxt is not False and entry.msgctxt != msgctxt:
+                    continue
+                return entry
+        return None
+
+    def materialize(self, index=0):
+        """
+        Materialize the entry at logical ``index`` (0 based, the header entry
+        is not counted) as an independent :class:`~polib.MOEntry`.
+
+        The returned object only holds decoded strings and keeps working once
+        the view has been closed.
+        """
+        self._check_open()
+        start = 1 if self._has_header else 0
+        count = len(self._descriptors) - start
+        if index < 0:
+            index += count
+        if index < 0 or index >= count:
+            raise IndexError('entry index out of range')
+        return self._materialize_abs(start + index)
+
+    def to_mofile(self, wrapwidth=78):
+        """
+        Eagerly build a regular, writable :class:`~polib.MOFile` with the same
+        metadata and entries as the view.
+        """
+        self._check_open()
+        mofile = MOFile(
+            fpath=self.fpath,
+            encoding=self.encoding,
+            wrapwidth=wrapwidth
+        )
+        mofile.magic_number = self.magic_number
+        mofile.version = self.version
+        mofile.metadata.update(self.metadata)
+        mofile.metadata_is_fuzzy = self.metadata_is_fuzzy
+        for entry in self:
+            mofile.append(entry)
+        return mofile
+
+    def ordered_metadata(self):
+        """
+        Convenience method mirroring :meth:`_BaseFile.ordered_metadata`.
+        """
+        mofile = MOFile()
+        mofile.metadata.update(self.metadata)
+        mofile.metadata_is_fuzzy = self.metadata_is_fuzzy
+        return mofile.ordered_metadata()
+
+    # -- internal helpers -------------------------------------------------
+
+    def _check_open(self):
+        if self.closed:
+            raise ValueError('Operation on a closed LazyMOView')
+
+    def _unpack(self, fmt, offset):
+        size = struct.calcsize(fmt)
+        return struct.unpack(self._endian + fmt,
+                             self._source.read_at(offset, size))
+
+    def _load_index(self):
+        filesize = len(self._source)
+        if filesize < 28:
+            raise IOError('Invalid mo file, file is too small')
+
+        magic = self._unpack('I', 0)[0]
+        if magic == self.MAGIC:
+            self._endian = '<'
+        elif magic == self.MAGIC_SWAPPED:
+            self._endian = '>'
+        else:
+            raise IOError('Invalid mo file, magic number is incorrect !')
+        self.magic_number = magic
+
+        version, nstrings = self._unpack('II', 4)
+        # from MO file format specs: "A program seeing an unexpected major
+        # revision number should stop reading the mo file entirely"
+        if version >> 16 not in (0, 1):
+            raise IOError(
+                'Invalid mo file, unexpected major revision number'
+            )
+        self.version = version
+
+        (key_offset, value_offset, hash_size, hash_offset) = \
+            self._unpack('IIII', 12)
+
+        # each slot holds two 32 bits integers (length + offset); every
+        # arithmetic is checked against the file size so a corrupted index
+        # cannot point outside the file
+        key_table_len = nstrings * 8
+        value_table_len = nstrings * 8
+        if nstrings > (filesize - 28) // 8:
+            raise IOError('Invalid mo file, string count is too large')
+        if not self._region_in_file(key_offset, key_table_len, filesize):
+            raise IOError('Invalid mo file, key index points outside file')
+        if not self._region_in_file(value_offset, value_table_len, filesize):
+            raise IOError('Invalid mo file, value index points outside file')
+
+        # the header and both index tables must not overlap one another
+        regions = [
+            (0, 28),
+            (key_offset, key_table_len),
+            (value_offset, value_table_len),
+        ]
+        if hash_size:
+            if hash_size > (filesize - 4) // 4 or not \
+                    self._region_in_file(hash_offset, hash_size * 4,
+                                         filesize):
+                raise IOError(
+                    'Invalid mo file, hash table points outside file'
+                )
+            regions.append((hash_offset, hash_size * 4))
+        if self._regions_overlap(regions):
+            raise IOError(
+                'Invalid mo file, index tables overlap the header'
+            )
+
+        # read both index tables in one validated read each
+        key_table = self._source.read_at(key_offset, key_table_len)
+        value_table = self._source.read_at(value_offset, value_table_len)
+        key_slots = struct.unpack(
+            self._endian + '%dI' % (2 * nstrings), key_table
+        )
+        value_slots = struct.unpack(
+            self._endian + '%dI' % (2 * nstrings), value_table
+        )
+
+        descriptors = []
+        for i in range(nstrings):
+            klen, koff = key_slots[2 * i], key_slots[2 * i + 1]
+            vlen, voff = value_slots[2 * i], value_slots[2 * i + 1]
+            # string payloads must lie within the file, must not overlap the
+            # header or an index table and must be NUL terminated: the
+            # declared length excludes the terminator, hence the + 1
+            self._check_string_slot(koff, klen, filesize, regions)
+            self._check_string_slot(voff, vlen, filesize, regions)
+            descriptors.append((klen, koff, vlen, voff))
+        self._descriptors = descriptors
+
+    @staticmethod
+    def _region_in_file(offset, length, filesize):
+        if offset > filesize or length > filesize - offset:
+            return False
+        return True
+
+    @staticmethod
+    def _regions_overlap(regions):
+        ordered = sorted(regions)
+        for i in range(1, len(ordered)):
+            prev_off, prev_len = ordered[i - 1]
+            off, length = ordered[i]
+            if off < prev_off + prev_len:
+                return True
+        return False
+
+    def _check_string_slot(self, offset, length, filesize,
+                           protected_regions):
+        # room for the payload plus its trailing NUL
+        if not self._region_in_file(offset, length + 1, filesize):
+            raise IOError('Invalid mo file, string points outside the file')
+        for region_offset, region_length in protected_regions:
+            if (offset < region_offset + region_length and
+                    region_offset < offset + length + 1):
+                raise IOError(
+                    'Invalid mo file, string overlaps the index tables'
+                )
+        if self._source.read_at(offset + length, 1) != b('\0'):
+            raise IOError('Invalid mo file, string is not NUL terminated')
+
+    def _load_header(self):
+        if not self._descriptors:
+            self._has_header = False
+            return
+        klen, koff, vlen, voff = self._descriptors[0]
+        if klen != 0:
+            # no header entry
+            self._has_header = False
+            return
+        self._has_header = True
+        header = self._source.read_at(voff, vlen)
+        if not self._encoding_explicit:
+            match = _MO_HEADER_CHARSET.search(header)
+            if match:
+                enc = match.group(1).strip().decode('ascii')
+                try:
+                    codecs.lookup(enc)
+                except LookupError:
+                    pass
+                else:
+                    self.encoding = enc
+        metadata = {}
+        for line in header.split(b('\n')):
+            tokens = line.split(b(':'), 1)
+            if tokens[0] != b(''):
+                try:
+                    key = tokens[0].decode(self.encoding)
+                    value = tokens[1].decode(self.encoding).strip()
+                except IndexError:
+                    value = u('')
+                except (UnicodeDecodeError, LookupError):
+                    continue
+                metadata[key] = value
+        self.metadata = metadata
+
+    def _find_index(self, msgid, msgctxt):
+        try:
+            target = msgid.encode(self.encoding)
+        except (UnicodeEncodeError, LookupError):
+            return None
+        want_context = msgctxt is not False
+        if want_context:
+            try:
+                target = msgctxt.encode(self.encoding) + b('\x04') + target
+            except (UnicodeEncodeError, AttributeError):
+                return None
+
+        start = 1 if self._has_header else 0
+        low, high = start, len(self._descriptors)
+        last = len(self._descriptors)
+
+        def primary(index):
+            klen, koff = self._descriptors[index][0:2]
+            # drop the plural part ("msgid\0msgid_plural")
+            raw_key = self._source.read_at(koff, klen)
+            return raw_key.split(b('\0'), 1)[0]
+
+        # The raw primary keys ("ctx\x04msgid" or plain "msgid") are sorted in
+        # a valid mo file, so a binary search never reorders them: a plain
+        # lookup matches the context free key exactly while a contextual
+        # lookup matches the "ctx\x04msgid" composite key exactly.
+        while low < high:
+            middle = (low + high) // 2
+            if primary(middle) < target:
+                low = middle + 1
+            else:
+                high = middle
+        if low < last and primary(low) == target:
+            return low
+        if not want_context:
+            # no context free key exists; mirror _BaseFile.find semantics and
+            # fall back to a contextual key sharing the same msgid.  Only raw
+            # keys are inspected, so non matching entries are never decoded.
+            for index in range(start, last):
+                raw_key = primary(index)
+                if b('\x04') in raw_key and raw_key.split(b('\x04'), 1)[1] \
+                        == target:
+                    return index
+        return None
+
+    def _materialize_abs(self, index):
+        self.decoded_entries += 1
+        klen, koff, vlen, voff = self._descriptors[index]
+        raw_key = self._source.read_at(koff, klen)
+        raw_value = self._source.read_at(voff, vlen)
+        encoding = self.encoding
+
+        key_parts = raw_key.split(b('\0'))
+        raw_msgid = key_parts[0]
+        raw_msgid_plural = key_parts[1] if len(key_parts) > 1 else None
+
+        context = None
+        if b('\x04') in raw_msgid:
+            context, raw_msgid = raw_msgid.split(b('\x04'), 1)
+
+        kwargs = {'msgid': raw_msgid.decode(encoding)}
+        if context is not None:
+            kwargs['msgctxt'] = context.decode(encoding)
+        if raw_msgid_plural is not None:
+            kwargs['msgid_plural'] = raw_msgid_plural.decode(encoding)
+            plurals = {}
+            for plural_index, part in enumerate(raw_value.split(b('\0'))):
+                plurals[plural_index] = part.decode(encoding)
+            kwargs['msgstr_plural'] = plurals
+        else:
+            kwargs['msgstr'] = raw_value.decode(encoding)
+        return MOEntry(**kwargs)
 # }}}
