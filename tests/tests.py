@@ -3,6 +3,7 @@
 
 import codecs
 import os
+import struct
 import subprocess
 import sys
 import tempfile
@@ -16,7 +17,9 @@ sys.path.insert(1, os.path.abspath('.'))
 
 import polib
 
-from polib import u
+from polib import b, u
+
+import mohash
 
 class TestFunctions(unittest.TestCase):
 
@@ -875,6 +878,183 @@ msgid "foo"
 msgstr "oof"
 ''')
         self.assertEqual(mo.__unicode__(), expected)
+
+
+class TestMoHashTable(unittest.TestCase):
+    """
+    Tests for the optional GNU-format hash table in mo exports, using the
+    standalone mohash.MoLookup finder.
+    """
+
+    def _build_po(self, extra_msgids=()):
+        po = polib.POFile()
+        po.metadata = {
+            'Project-Id-Version': 'mohash 1.0',
+            'Content-Type': 'text/plain; charset=utf-8',
+        }
+        po.append(polib.POEntry(msgid='hello', msgstr='bonjour'))
+        po.append(polib.POEntry(
+            msgid='File', msgstr='Fichier', msgctxt='menu'))
+        po.append(polib.POEntry(
+            msgid='apple', msgid_plural='apples',
+            msgstr_plural={0: 'pomme', 1: 'pommes'}))
+        for msgid in extra_msgids:
+            po.append(polib.POEntry(msgid=msgid, msgstr='tr:' + msgid))
+        return po
+
+    def _colliding_groups(self, size, groups=3, members=3):
+        """
+        Find ``groups`` distinct sets of ``members`` msgids whose GNU hash
+        values collide modulo ``size``.
+        """
+        buckets = {}
+        i = 0
+        while True:
+            candidate = 'collide-%06d' % i
+            i += 1
+            bucket = mohash.gnu_hash(candidate.encode('utf-8')) % size
+            buckets.setdefault(bucket, []).append(candidate)
+            found = [sorted(m) for m in buckets.values()
+                     if len(m) >= members]
+            if len(found) >= groups:
+                return sorted(found)[:groups]
+
+    def _swap_words(self, data):
+        """
+        Rewrite a little-endian mo catalog as big-endian (all 32-bit
+        header, index and hash-table words byte-swapped, strings kept
+        as-is).
+        """
+        nstrings, orig_off, trans_off, hash_size, hash_off = \
+            struct.unpack('<5I', data[8:28])
+        offsets = list(range(0, 28, 4))
+        for i in range(nstrings):
+            offsets += [orig_off + 8 * i, orig_off + 8 * i + 4,
+                        trans_off + 8 * i, trans_off + 8 * i + 4]
+        offsets += [hash_off + 4 * i for i in range(hash_size)]
+        swapped = bytearray(data)
+        for off in offsets:
+            word = struct.unpack('<I', bytes(swapped[off:off + 4]))[0]
+            swapped[off:off + 4] = struct.pack('>I', word)
+        return bytes(swapped)
+
+    def test_gnu_hash_table_lookup(self):
+        """
+        Export with a hash table and resolve every entry through the
+        standalone finder, including deliberately colliding keys.
+        """
+        entries_len = 1 + 3 + 9  # metadata + fixed entries + collisions
+        size = polib._next_prime(entries_len * 4 // 3)
+        groups = self._colliding_groups(size)
+        extra = [msgid for group in groups for msgid in group]
+        po = self._build_po(extra)
+        data = po.to_binary(with_hash_table=True)
+
+        # header and layout follow the GNU format
+        nstrings, orig_off, trans_off, hash_size, hash_off = \
+            struct.unpack('<5I', data[8:28])
+        self.assertEqual(nstrings, entries_len)
+        self.assertEqual(hash_size, size)
+        self.assertEqual(hash_off, 7 * 4 + 16 * nstrings)
+        first_len, first_off = struct.unpack(
+            '<2I', data[orig_off:orig_off + 8])
+        self.assertEqual(first_off, hash_off + 4 * hash_size)
+
+        # slots hold 1-based entry numbers, 0 marks empty slots, and every
+        # entry (metadata included) appears exactly once
+        words = struct.unpack('<%dI' % hash_size,
+                              data[hash_off:hash_off + 4 * hash_size])
+        self.assertIn(0, words)
+        self.assertEqual(sorted(w for w in words if w != 0),
+                         list(range(1, nstrings + 1)))
+
+        table = mohash.MoLookup(data)
+        self.assertEqual(table.hash_size, size)
+        expected = {
+            b('hello'): b('bonjour'),
+            b('menu\x04File'): b('Fichier'),
+            b('apple'): b('pomme\x00pommes'),
+        }
+        for msgid in extra:
+            expected[msgid.encode('utf-8')] = \
+                ('tr:' + msgid).encode('utf-8')
+        for key, translation in expected.items():
+            self.assertEqual(table.lookup(key), translation)
+
+        # colliding groups are really resolved by probing
+        for group in groups:
+            probes = []
+            for msgid in group:
+                table.lookup(msgid.encode('utf-8'))
+                probes.append(table.last_probes)
+            self.assertTrue(max(probes) > 1)
+
+        # the metadata entry is reachable through the hash table
+        metadata = table.lookup(b(''))
+        self.assertIn(b('Project-Id-Version: mohash 1.0'), metadata)
+
+    def test_missing_keys_terminate(self):
+        """
+        Keys absent from the catalog return None within hash_size probes,
+        and NUL/context boundaries are not confused.
+        """
+        po = self._build_po(['k%d' % i for i in range(20)])
+        table = mohash.MoLookup(po.to_binary(with_hash_table=True))
+        for missing in (b('no-such-key'), b('hello2'), b('menu'),
+                        b('apples'), b('File')):
+            self.assertIsNone(table.lookup(missing))
+            self.assertTrue(table.last_probes <= table.hash_size)
+
+    def test_big_endian_catalog(self):
+        """
+        A big-endian variant of the same catalog is equally readable.
+        """
+        extra = ['extra-%d' % i for i in range(10)]
+        po = self._build_po(extra)
+        data = self._swap_words(po.to_binary(with_hash_table=True))
+        table = mohash.MoLookup(data)
+        self.assertEqual(table.lookup(b('hello')), b('bonjour'))
+        self.assertEqual(table.lookup(b('menu\x04File')), b('Fichier'))
+        self.assertEqual(table.lookup(b('apple')), b('pomme\x00pommes'))
+        self.assertEqual(table.lookup(b('extra-3')), b('tr:extra-3'))
+        self.assertIsNone(table.lookup(b('absent')))
+        # polib's own parser reads the swapped catalog too
+        mo = polib.mofile(data)
+        self.assertEqual(mo.find('hello').msgstr, u('bonjour'))
+
+    def test_export_without_hash_table(self):
+        """
+        The default export keeps a zero-sized hash table and stays
+        readable (finder falls back to a linear scan).
+        """
+        po = self._build_po(['x1', 'x2'])
+        data = po.to_binary()
+        self.assertEqual(struct.unpack('<I', data[20:24])[0], 0)
+        table = mohash.MoLookup(data)
+        self.assertEqual(table.hash_size, 0)
+        self.assertEqual(table.lookup(b('hello')), b('bonjour'))
+        self.assertEqual(table.lookup(b('menu\x04File')), b('Fichier'))
+        self.assertIsNone(table.lookup(b('absent')))
+        mo = polib.mofile(data)
+        self.assertEqual(mo.find('hello').msgstr, u('bonjour'))
+
+    def test_save_as_mofile_with_hash_table(self):
+        """
+        save_as_mofile(with_hash_table=True) writes a catalog the finder
+        can read back from disk.
+        """
+        po = self._build_po(['z1', 'z2'])
+        fd, tmpfile = tempfile.mkstemp()
+        os.close(fd)
+        try:
+            po.save_as_mofile(tmpfile, with_hash_table=True)
+            table = mohash.MoLookup.from_file(tmpfile)
+            self.assertTrue(table.hash_size > 0)
+            self.assertEqual(table.lookup(b('z1')), b('tr:z1'))
+            self.assertEqual(table.lookup(b('z2')), b('tr:z2'))
+            self.assertIsNone(table.lookup(b('z3')))
+        finally:
+            os.remove(tmpfile)
 
 
 if __name__ == '__main__':

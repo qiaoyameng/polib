@@ -288,6 +288,91 @@ def natural_sort(lst):
     return sorted(lst, key=alphanum_key)
 
 # }}}
+# function _mo_hash_string {{{
+
+
+def _mo_hash_string(key):
+    """
+    GNU gettext ``hash_string()`` (PJW variant) computed over the encoded
+    key bytes, i.e. the raw msgid as stored in the mo file, including any
+    msgctxt <EOT> prefix. Like the C original, the hash stops at the first
+    NUL byte, so plural originals are hashed by their singular form only.
+    """
+    hval = 0
+    for byte in bytearray(key):
+        if byte == 0:
+            break
+        hval = (hval << 4) + byte
+        g = hval & 0xf0000000
+        if g != 0:
+            hval ^= g >> 24
+            hval ^= g
+        hval &= 0xffffffff
+    return hval
+# }}}
+# function _next_prime {{{
+
+
+def _next_prime(n):
+    """
+    Return the smallest prime number >= ``n``. The result is always an odd
+    prime >= 3, which guarantees that ``size - 2 >= 1`` when the result is
+    used as a hash table size.
+    """
+    def is_prime(candidate):
+        if candidate < 2:
+            return False
+        if candidate % 2 == 0:
+            return candidate == 2
+        divisor = 3
+        while divisor * divisor <= candidate:
+            if candidate % divisor == 0:
+                return False
+            divisor += 2
+        return True
+
+    n = max(int(n), 1) | 1
+    while not is_prime(n):
+        n += 2
+    return n
+# }}}
+# function _mo_hash_table {{{
+
+
+def _mo_hash_table(keys):
+    """
+    Build a GNU-format mo hash table for the given list of encoded keys.
+
+    Returns a ``(size, table)`` tuple where ``table`` holds 1-based entry
+    indices (0 means an empty slot). The table size is a prime chosen so
+    that the load factor stays below 3/4 and open-addressing insertion
+    always terminates; it is grown and the table rebuilt if insertion ever
+    fails to find an empty slot. Collisions are resolved with the GNU
+    prescribed step ``1 + hash % (size - 2)``.
+    """
+    size = _next_prime(len(keys) * 4 // 3)
+    while True:
+        table = [0] * size
+        complete = True
+        for index, key in enumerate(keys):
+            hval = _mo_hash_string(key)
+            idx = hval % size
+            incr = 1 + (hval % (size - 2))
+            probes = 0
+            while table[idx] != 0 and probes < size:
+                idx += incr
+                if idx >= size:
+                    idx -= size
+                probes += 1
+            if table[idx] != 0:
+                # no empty slot reachable, grow the table and retry
+                complete = False
+                break
+            table[idx] = index + 1
+        if complete:
+            return size, table
+        size = _next_prime(size * 2)
+# }}}
 # class _BaseFile {{{
 
 
@@ -429,7 +514,8 @@ class _BaseFile(list):
             e.flags.append('fuzzy')
         return e
 
-    def save(self, fpath=None, repr_method='__unicode__', newline=None):
+    def save(self, fpath=None, repr_method='__unicode__', newline=None,
+             repr_kwargs=None):
         """
         Saves the po file to ``fpath``.
         If it is an existing file and no ``fpath`` is provided, then the
@@ -445,10 +531,15 @@ class _BaseFile(list):
 
         ``newline``
             string, controls how universal newlines works
+
+        ``repr_kwargs``
+            dict, optional keyword arguments passed to the repr method.
         """
         if self.fpath is None and fpath is None:
             raise IOError('You must provide a file path to save() method')
-        contents = getattr(self, repr_method)()
+        if repr_kwargs is None:
+            repr_kwargs = {}
+        contents = getattr(self, repr_method)(**repr_kwargs)
         if fpath is None:
             fpath = self.fpath
         if repr_method == 'to_binary':
@@ -550,9 +641,16 @@ class _BaseFile(list):
             ordered_data.append((data, value))
         return ordered_data
 
-    def to_binary(self):
+    def to_binary(self, with_hash_table=False):
         """
         Return the binary representation of the file.
+
+        Keyword argument:
+
+        ``with_hash_table``
+            bool, if True, a GNU-format hash table is embedded in the
+            output so that gettext runtimes can look up msgids without
+            scanning the whole catalog (defaults to False).
         """
         offsets = []
         entries = self.translated_entries()
@@ -574,6 +672,7 @@ class _BaseFile(list):
         entries = [mentry] + entries
         entries_len = len(entries)
         ids, strs = b(''), b('')
+        keys = []
         for e in entries:
             # For each string, we need size and file offset.  Each string is
             # NUL terminated; the NUL does not count into the size.
@@ -591,12 +690,21 @@ class _BaseFile(list):
             else:
                 msgid += self._encode(e.msgid)
                 msgstr = self._encode(e.msgstr)
+            keys.append(msgid)
             offsets.append((len(ids), len(msgid), len(strs), len(msgstr)))
             ids += msgid + b('\0')
             strs += msgstr + b('\0')
 
+        # Optional GNU-format hash table over the encoded keys (msgctxt
+        # prefix and plural separator included, trailing NUL excluded).
+        if with_hash_table:
+            hash_size, hash_table = _mo_hash_table(keys)
+        else:
+            hash_size, hash_table = 0, []
+
         # The header is 7 32-bit unsigned integers.
-        keystart = 7 * 4 + 16 * entries_len
+        hashstart = 7 * 4 + 16 * entries_len
+        keystart = hashstart + 4 * hash_size
         # and the values start after the keys
         valuestart = keystart + len(ids)
         koffsets = []
@@ -620,14 +728,20 @@ class _BaseFile(list):
             7 * 4,
             # start of value index
             7 * 4 + entries_len * 8,
-            # size and offset of hash table, we don't use hash tables
-            0, keystart
+            # size and offset of the hash table (0 when not used)
+            hash_size,
+            hashstart if with_hash_table else keystart
 
         )
         if PY3 and sys.version_info.minor > 1:  # python 3.2 or superior
             output += array.array("i", offsets).tobytes()
         else:
             output += array.array("i", offsets).tostring()
+        if with_hash_table:
+            if PY3 and sys.version_info.minor > 1:
+                output += array.array("i", hash_table).tobytes()
+            else:
+                output += array.array("i", hash_table).tostring()
         output += ids
         output += strs
         return output
@@ -669,7 +783,7 @@ class POFile(_BaseFile):
 
         return ret + _BaseFile.__unicode__(self)
 
-    def save_as_mofile(self, fpath):
+    def save_as_mofile(self, fpath, with_hash_table=False):
         """
         Saves the binary representation of the file to given ``fpath``.
 
@@ -677,8 +791,15 @@ class POFile(_BaseFile):
 
         ``fpath``
             string, full or relative path to the mo file.
+
+        ``with_hash_table``
+            bool, whether to embed a GNU-format hash table in the
+            generated mo file (defaults to False).
         """
-        _BaseFile.save(self, fpath, 'to_binary')
+        _BaseFile.save(
+            self, fpath, 'to_binary',
+            repr_kwargs={'with_hash_table': with_hash_table}
+        )
 
     def percent_translated(self):
         """
@@ -781,7 +902,7 @@ class MOFile(_BaseFile):
         """
         _BaseFile.save(self, fpath)
 
-    def save(self, fpath=None):
+    def save(self, fpath=None, with_hash_table=False):
         """
         Saves the mofile to ``fpath``.
 
@@ -789,8 +910,15 @@ class MOFile(_BaseFile):
 
         ``fpath``
             string, full or relative path to the file.
+
+        ``with_hash_table``
+            bool, whether to embed a GNU-format hash table in the
+            generated mo file (defaults to False).
         """
-        _BaseFile.save(self, fpath, 'to_binary')
+        _BaseFile.save(
+            self, fpath, 'to_binary',
+            repr_kwargs={'with_hash_table': with_hash_table}
+        )
 
     def percent_translated(self):
         """
