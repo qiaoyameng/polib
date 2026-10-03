@@ -695,6 +695,224 @@ class TestPoFile(unittest.TestCase):
         expected_po = polib.pofile('tests/test_merge_after.po')
         self.assertEqual(po, expected_po)
 
+    def _migration_catalog(self, entries, plural_entries=(), contexts=()):
+        catalog = polib.POFile()
+        for msgid, msgstr in entries:
+            catalog.append(polib.POEntry(msgid=msgid, msgstr=msgstr))
+        for msgid, msgid_plural, translations in plural_entries:
+            catalog.append(polib.POEntry(
+                msgid=msgid,
+                msgid_plural=msgid_plural,
+                msgstr_plural=translations,
+            ))
+        for msgctxt, msgid, msgstr in contexts:
+            catalog.append(polib.POEntry(
+                msgctxt=msgctxt,
+                msgid=msgid,
+                msgstr=msgstr,
+            ))
+        return catalog
+
+    def test_translation_migration_plan_uses_global_matching(self):
+        po = self._migration_catalog([
+            ('Save the project', 'Guardar el proyecto'),
+            ('Saved the project', 'Proyecto guardado'),
+        ])
+        refpot = self._migration_catalog([
+            ('Saved the project.', ''),
+            ('Save the project now', ''),
+        ])
+        greedy_scores = [
+            [0.941176, 0.888889],
+            [0.971429, 0.864865],
+        ]
+        self.assertGreater(
+            greedy_scores[0][0], greedy_scores[0][1]
+        )
+        self.assertGreater(
+            greedy_scores[1][0], greedy_scores[1][1]
+        )
+        self.assertGreater(
+            greedy_scores[0][1] + greedy_scores[1][0],
+            greedy_scores[0][0] + greedy_scores[1][1],
+        )
+
+        plan = po.translation_migration_plan(refpot)
+        self.assertEqual(
+            [
+                (match['source']['msgid'], match['target']['msgid'])
+                for match in plan['matches']
+                if match['selected']
+            ],
+            [
+                ('Save the project', 'Save the project now'),
+                ('Saved the project', 'Saved the project.'),
+            ],
+        )
+        self.assertTrue(all(
+            match['adopt'] for match in plan['matches']
+            if match['selected']
+        ))
+        self.assertFalse(any(
+            match['adopt'] for match in plan['matches']
+            if not match['selected']
+        ))
+        self.assertEqual(len(plan['matches']), 4)
+        self.assertEqual(
+            po.translation_migration_plan(refpot),
+            plan,
+        )
+
+        po.apply_translation_migration(refpot, plan)
+        migrated = [
+            (entry.msgid, entry.msgstr, entry.fuzzy)
+            for entry in po
+        ]
+        self.assertEqual(sorted(migrated), sorted([
+            ('Save the project now', 'Guardar el proyecto', True),
+            ('Saved the project.', 'Proyecto guardado', True),
+        ]))
+        now_entry = po.find('Save the project now')
+        saved_entry = po.find('Saved the project.')
+        self.assertEqual(now_entry.previous_msgid, 'Save the project')
+        self.assertEqual(saved_entry.previous_msgid, 'Saved the project')
+        self.assertEqual(refpot.find('Save the project now').msgstr, '')
+        self.assertFalse(any(entry.obsolete for entry in po))
+
+        po = self._migration_catalog([
+            ('Save the project', 'Guardar el proyecto'),
+            ('Saved the project', 'Proyecto guardado'),
+        ])
+        refpot = self._migration_catalog([
+            ('Saved the project.', ''),
+            ('Save the project now', ''),
+        ])
+        plan = po.translation_migration_plan(refpot)
+        alternative = next(
+            match for match in plan['matches']
+            if match['source']['msgid'] == 'Save the project'
+            and match['target']['msgid'] == 'Saved the project.'
+        )
+        po.apply_translation_migration(
+            refpot,
+            plan,
+            {alternative['source']['fingerprint']:
+             alternative['target']['fingerprint']},
+        )
+        self.assertEqual(po.find('Saved the project.').msgstr,
+                         'Guardar el proyecto')
+        self.assertEqual(po.find('Save the project now').msgstr, '')
+
+    def test_translation_migration_candidate_gates(self):
+        po = self._migration_catalog(
+            [
+                ('Save %s', 'Guardar %s'),
+                ('Save now', 'Guardar ahora'),
+            ],
+            plural_entries=[
+                ('%d item', '%d items', {0: '%d elemento', 1: '%d elementos'}),
+            ],
+            contexts=[('menu', 'Save', 'Guardar')],
+        )
+        refpot = self._migration_catalog(
+            [
+                ('Save %d', ''),
+                ('Save now!', ''),
+            ],
+            plural_entries=[
+                ('%d item', '', {}),
+            ],
+            contexts=[('button', 'Save', '')],
+        )
+        plan = po.translation_migration_plan(refpot)
+        compatible = [
+            match for match in plan['matches']
+            if match['source']['msgid'] in ('Save %s', '%d item')
+            or match['source'].get('msgctxt') == 'menu'
+        ]
+        self.assertEqual(compatible, [])
+        low_match = [
+            match for match in plan['matches']
+            if match['source']['msgid'] == 'Save now'
+        ][0]
+        self.assertEqual(low_match['target']['msgid'], 'Save now!')
+        self.assertEqual(low_match['confidence'], 'high')
+
+    def test_translation_migration_leaves_low_and_tied_to_caller(self):
+        po = self._migration_catalog([
+            ('Save a file', 'Guardar un archivo'),
+            ('Save b file', 'Guardar otro archivo'),
+        ])
+        tied_pot = self._migration_catalog([
+            ('Save c file', ''),
+        ])
+        tied_plan = po.translation_migration_plan(tied_pot)
+        selected = [
+            match for match in tied_plan['matches']
+            if match['selected']
+        ][0]
+        self.assertEqual(selected['confidence'], 'tied')
+        self.assertFalse(selected['adopt'])
+
+        po.apply_translation_migration(tied_pot, tied_plan)
+        self.assertEqual(po.find('Save c file').msgstr, '')
+        self.assertTrue(po.find(
+            'Save a file', include_obsolete_entries=True
+        ).obsolete)
+        self.assertTrue(po.find(
+            'Save b file', include_obsolete_entries=True
+        ).obsolete)
+
+        low_po = self._migration_catalog([
+            ('Save the project', 'Guardar el proyecto'),
+        ])
+        low_pot = self._migration_catalog([
+            ('Please save project', ''),
+        ])
+        low_plan = low_po.translation_migration_plan(low_pot)
+        self.assertEqual(low_plan['matches'][0]['confidence'], 'low')
+        low_po.apply_translation_migration(low_pot, low_plan)
+        self.assertEqual(low_po.find('Please save project').msgstr, '')
+
+    def test_translation_migration_caller_decision_and_stale_plan(self):
+        po = self._migration_catalog([
+            ('Saved', 'Guardado'),
+        ])
+        refpot = self._migration_catalog([
+            ('Saved!', ''),
+        ])
+        plan = po.translation_migration_plan(refpot)
+        po.apply_translation_migration(
+            refpot,
+            plan,
+            {plan['matches'][0]['target']['fingerprint']: True},
+        )
+        entry = po.find('Saved!')
+        self.assertEqual(entry.msgstr, 'Guardado')
+        self.assertTrue(entry.fuzzy)
+
+        po2 = self._migration_catalog([
+            ('Saved', 'Guardado'),
+        ])
+        refpot2 = self._migration_catalog([
+            ('Saved!', ''),
+        ])
+        plan2 = po2.translation_migration_plan(refpot2)
+        po2.append(polib.POEntry(msgid='Changed after planning', msgstr=''))
+        with self.assertRaises(ValueError):
+            po2.apply_translation_migration(refpot2, plan2)
+
+        po3 = self._migration_catalog([
+            ('Saved', 'Guardado'),
+        ])
+        refpot3 = self._migration_catalog([
+            ('Saved!', ''),
+        ])
+        plan3 = po3.translation_migration_plan(refpot3)
+        refpot3.append(polib.POEntry(msgid='Changed template', msgstr=''))
+        with self.assertRaises(ValueError):
+            po3.apply_translation_migration(refpot3, plan3)
+
     def test_percent_translated(self):
         po = polib.pofile('tests/test_pofile_helpers.po')
         self.assertEqual(po.percent_translated(), 53)

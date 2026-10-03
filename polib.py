@@ -14,12 +14,14 @@ modify entries, comments or metadata, etc. or create new po files from scratch.
 
 import array
 import codecs
+import hashlib
 import os
 import re
 import struct
 import sys
 import textwrap
 import io
+from difflib import SequenceMatcher
 
 
 __author__ = 'David Jean Louis <izimobil@gmail.com>'
@@ -96,6 +98,233 @@ def _is_file(filename_or_contents):
         return os.path.isfile(filename_or_contents)
     except (TypeError, ValueError, UnicodeEncodeError):
         return False
+# }}}
+# migration helpers {{{
+
+_MIGRATION_PERCENT_PLACEHOLDERS = re.compile(
+    r'%(?:\([^)]*\))?[+#0\- ]*(?:\d+\$)?(?:\d+|\*)?(?:\.(?:\d+|\*))?'
+    r'(?:[hlLqjzzt]+)?[diouxXeEfFgGaAcspn]'
+)
+_MIGRATION_BRACE_PLACEHOLDERS = re.compile(r'\{[^{}]*\}')
+
+
+def _migration_catalog_fingerprint(catalog):
+    return hashlib.sha1(
+        catalog.__unicode__().encode('utf-8')
+    ).hexdigest()
+
+
+def _migration_file_fingerprint(fpath):
+    if not fpath or not _is_file(fpath):
+        return None
+    with open(fpath, 'rb') as fhandle:
+        return hashlib.sha1(fhandle.read()).hexdigest()
+
+
+def _migration_entry_identity(entry):
+    fingerprint_fields = [
+        entry.msgctxt or u(''),
+        entry.msgid,
+        entry.msgid_plural or u(''),
+        u('plural') if entry.msgid_plural else u('singular'),
+    ]
+    fingerprint = hashlib.sha1(
+        ('\x00'.join(fingerprint_fields)).encode('utf-8')
+    ).hexdigest()
+    return {
+        'fingerprint': fingerprint,
+        'msgctxt': entry.msgctxt,
+        'msgid': entry.msgid,
+        'msgid_plural': entry.msgid_plural or None,
+    }
+
+
+def _migration_identity_key(identity):
+    return (
+        identity.get('msgctxt') or '',
+        identity.get('msgid') or '',
+        identity.get('msgid_plural') or '',
+        bool(identity.get('msgid_plural')),
+    )
+
+
+def _migration_format_placeholders(value):
+    placeholders = []
+    index = 0
+    while index < len(value):
+        if value.startswith('%%', index):
+            index += 2
+            continue
+        if value.startswith('{{', index) or value.startswith('}}', index):
+            index += 2
+            continue
+        match = _MIGRATION_PERCENT_PLACEHOLDERS.match(value, index)
+        if match is None:
+            match = _MIGRATION_BRACE_PLACEHOLDERS.match(value, index)
+        if match is None:
+            index += 1
+        else:
+            placeholders.append(match.group(0))
+            index = match.end()
+    placeholders.sort()
+    return placeholders
+
+
+def _migration_has_translation(entry):
+    if entry.msgid_plural:
+        return any(
+            translation != '' for translation in entry.msgstr_plural.values()
+        )
+    return entry.msgstr != ''
+
+
+def _migration_compatible(source, target):
+    if (source.msgctxt or None) != (target.msgctxt or None):
+        return False
+    if bool(source.msgid_plural) != bool(target.msgid_plural):
+        return False
+    if _migration_format_placeholders(source.msgid) != \
+            _migration_format_placeholders(target.msgid):
+        return False
+    if source.msgid_plural and \
+            _migration_format_placeholders(source.msgid_plural) != \
+            _migration_format_placeholders(target.msgid_plural):
+        return False
+    return True
+
+
+def _migration_similarity(source, target):
+    scores = [SequenceMatcher(None, source.msgid, target.msgid).ratio()]
+    if source.msgid_plural:
+        scores.append(
+            SequenceMatcher(
+                None, source.msgid_plural, target.msgid_plural
+            ).ratio()
+        )
+    return round(sum(scores) / float(len(scores)), 6)
+
+
+def _maximum_weight_matching(weights):
+    size = len(weights)
+    if size == 0:
+        return [], [], []
+    scale = 1000000
+    integer_weights = [
+        [int(round(weight * scale)) for weight in row]
+        for row in weights
+    ]
+    cost = [
+        [scale - weight for weight in row]
+        for row in integer_weights
+    ]
+    u = [0] * (size + 1)
+    v = [0] * (size + 1)
+    p = [0] * (size + 1)
+    way = [0] * (size + 1)
+    for row in range(1, size + 1):
+        p[0] = row
+        column = 0
+        minima = [float('inf')] * (size + 1)
+        used = [False] * (size + 1)
+        while p[column] != 0:
+            used[column] = True
+            current_row = p[column]
+            delta = float('inf')
+            next_column = 0
+            for candidate in range(1, size + 1):
+                if used[candidate]:
+                    continue
+                current = cost[current_row - 1][candidate - 1] \
+                    - u[current_row] - v[candidate]
+                if current < minima[candidate]:
+                    minima[candidate] = current
+                    way[candidate] = column
+                if minima[candidate] < delta:
+                    delta = minima[candidate]
+                    next_column = candidate
+            for candidate in range(size + 1):
+                if used[candidate]:
+                    u[p[candidate]] += delta
+                    v[candidate] -= delta
+                else:
+                    minima[candidate] -= delta
+            column = next_column
+        while True:
+            previous_column = way[column]
+            p[column] = p[previous_column]
+            column = previous_column
+            if column == 0:
+                break
+    pairs = []
+    for column in range(1, size + 1):
+        row = p[column]
+        if row and weights[row - 1][column - 1] > 0:
+            pairs.append((row - 1, column - 1))
+    return pairs, u, v
+
+
+def _migration_tight_matches(weights, pairs, u, v):
+    size = len(weights)
+    if size == 0:
+        return set()
+    assigned_columns = dict(
+        (row, column) for row, column in pairs
+        if row < len(weights)
+        and column < len(weights)
+        and weights[row][column] > 0
+    )
+    assigned_rows = dict(
+        (column, row) for row, column in assigned_columns.items()
+    )
+    active_rows = set(
+        row for row, row_weights in enumerate(weights)
+        if any(weight > 0 for weight in row_weights)
+    )
+    active_columns = set(
+        column for column in range(size)
+        if any(weights[row][column] > 0 for row in range(size))
+    )
+    scale = 1000000
+    equality_edges = {}
+    for row in active_rows:
+        for column in active_columns:
+            weight = weights[row][column]
+            if weight <= 0 or assigned_columns.get(row) == column:
+                continue
+            integer_weight = int(round(weight * scale))
+            reduced_cost = scale - integer_weight - u[row + 1] \
+                - v[column + 1]
+            if reduced_cost == 0:
+                equality_edges.setdefault(row, []).append(column)
+    tight_edges = set()
+    for start in active_rows:
+        states = [(start, set([start]), set())]
+        while states:
+            row, visited_rows, visited_edges = states.pop()
+            for column in equality_edges.get(row, []):
+                next_row = assigned_rows.get(column)
+                if next_row is None:
+                    continue
+                edge = (row, column)
+                if edge in visited_edges:
+                    continue
+                if next_row == start and len(visited_rows) > 1:
+                    tight_edges.update(visited_edges)
+                    tight_edges.add(edge)
+                elif next_row not in visited_rows:
+                    states.append((
+                        next_row,
+                        visited_rows | set([next_row]),
+                        visited_edges | set([edge]),
+                    ))
+    cycle_rows = set(row for row, column in tight_edges)
+    cycle_columns = set(column for row, column in tight_edges)
+    for row in cycle_rows:
+        tight_edges.add((row, assigned_columns[row]))
+    for row, column in pairs:
+        if row in cycle_rows and column in cycle_columns:
+            tight_edges.add((row, column))
+    return tight_edges
 # }}}
 # function pofile() {{{
 
@@ -748,6 +977,430 @@ class POFile(_BaseFile):
         for entry in self:
             if entry.msgid_with_context not in refpot_msgids:
                 entry.obsolete = True
+
+    def translation_migration_plan(self, refpot, min_similarity=0.5,
+                                   min_confidence=0.85):
+        """
+        Build a one-to-one translation migration plan for wording changes.
+
+        Candidate pairs must use the same context and plural form and must
+        preserve format placeholders. Similarity is then used to select a
+        global maximum weight matching. Only unique, high confidence matches
+        are marked for automatic adoption; tied and low confidence matches
+        remain available for an explicit caller decision.
+        """
+        active_sources = [
+            entry for entry in self
+            if not entry.obsolete
+            and entry.msgid != ''
+        ]
+        targets = [
+            entry for entry in refpot
+            if not entry.obsolete and entry.msgid != ''
+        ]
+        active_sources.sort(
+            key=lambda entry: (
+                entry.msgctxt or '',
+                entry.msgid,
+                entry.msgid_plural or '',
+            )
+        )
+        targets.sort(
+            key=lambda entry: (
+                entry.msgctxt or '',
+                entry.msgid,
+                entry.msgid_plural or '',
+            )
+        )
+        source_identities = [
+            _migration_entry_identity(entry) for entry in active_sources
+        ]
+        target_identities = [
+            _migration_entry_identity(entry) for entry in targets
+        ]
+        source_keys = set(
+            _migration_identity_key(identity)
+            for identity in source_identities
+        )
+        target_keys = set(
+            _migration_identity_key(identity)
+            for identity in target_identities
+        )
+        old_entries = [
+            identity for identity in source_identities
+            if _migration_identity_key(identity) not in target_keys
+        ]
+        new_entries = [
+            identity for identity in target_identities
+            if _migration_identity_key(identity) not in source_keys
+        ]
+        old_translated_entries = [
+            entry for entry in active_sources
+            if _migration_has_translation(entry)
+            and _migration_identity_key(_migration_entry_identity(entry))
+            not in target_keys
+        ]
+        old_translated_identities = [
+            _migration_entry_identity(entry)
+            for entry in old_translated_entries
+        ]
+        old_translated_positions = dict(
+            (_migration_identity_key(identity), index)
+            for index, identity in enumerate(old_translated_identities)
+        )
+        new_target_positions = dict(
+            (_migration_identity_key(identity), index)
+            for index, identity in enumerate(new_entries)
+        )
+        new_target_entries = [
+            target for target in targets
+            if _migration_identity_key(_migration_entry_identity(target))
+            in new_target_positions
+        ]
+        candidates = {}
+        for source_index, source in enumerate(old_translated_entries):
+            for target_index, target in enumerate(new_target_entries):
+                if not _migration_compatible(source, target):
+                    continue
+                score = _migration_similarity(source, target)
+                if score < min_similarity:
+                    continue
+                candidates.setdefault(source_index, {})[target_index] = score
+
+        size = max(
+            len(old_translated_entries),
+            len(new_target_entries),
+        )
+        weights = [[0] * size for _ in range(size)]
+        for source_index, rows in candidates.items():
+            for target_index, score in rows.items():
+                weights[source_index][target_index] = score
+        pairs, potentials_u, potentials_v = _maximum_weight_matching(weights)
+        tight_edges = _migration_tight_matches(
+            weights, pairs, potentials_u, potentials_v
+        )
+        best_by_source = {}
+        best_by_target = {}
+        for source_index, rows in candidates.items():
+            best_by_source[source_index] = max(rows.values())
+        for target_index in range(len(new_target_entries)):
+            target_scores = [
+                rows[target_index]
+                for rows in candidates.values()
+                if target_index in rows
+            ]
+            if target_scores:
+                best_by_target[target_index] = max(target_scores)
+
+        matches = []
+        matched_sources = set()
+        matched_targets = set()
+        selected_pairs = [
+            pair for pair in pairs
+            if pair[0] < len(old_translated_entries)
+            and pair[1] < len(new_target_entries)
+            and weights[pair[0]][pair[1]] > 0
+        ]
+        selected_pair_set = set(selected_pairs)
+        candidate_pairs = sorted(
+            [
+                (source_index, target_index)
+                for source_index, rows in candidates.items()
+                for target_index in rows
+            ],
+            key=lambda pair: (
+                _migration_identity_key(
+                    old_translated_identities[pair[0]]
+                ),
+                _migration_identity_key(new_entries[pair[1]]),
+            )
+        )
+        for source_index, target_index in candidate_pairs:
+            source_identity = old_translated_identities[source_index]
+            target_identity = new_entries[target_index]
+            score = weights[source_index][target_index]
+            source_scores = list(candidates[source_index].values())
+            source_tied = best_by_source.get(source_index) == score and \
+                source_scores.count(score) > 1
+            target_matching_sources = [
+                row_index for row_index, rows in candidates.items()
+                if rows.get(target_index) == score
+            ]
+            target_tied = best_by_target.get(target_index) == score and \
+                len(target_matching_sources) > 1
+            ambiguous = source_tied or target_tied or (
+                source_index, target_index
+            ) in tight_edges
+            selected = (source_index, target_index) in selected_pair_set
+            if ambiguous:
+                confidence = 'tied'
+            elif score >= min_confidence:
+                confidence = 'high'
+            else:
+                confidence = 'low'
+            adopted = selected and confidence == 'high'
+            alternatives = []
+            for alternative_target, alternative_score in sorted(
+                candidates[source_index].items(),
+                key=lambda item: (
+                    -item[1],
+                    _migration_identity_key(new_entries[item[0]]),
+                )
+            ):
+                alternatives.append({
+                    'target': new_entries[alternative_target],
+                    'similarity': alternative_score,
+                })
+            matches.append({
+                'source': source_identity,
+                'target': target_identity,
+                'similarity': score,
+                'confidence': confidence,
+                'selected': selected,
+                'adopt': adopted,
+                'alternatives': alternatives,
+            })
+        for source_index, target_index in selected_pairs:
+            matched_sources.add(source_index)
+            matched_targets.add(target_index)
+
+        unmatched_old_entries = []
+        for identity in old_entries:
+            identity_key = _migration_identity_key(identity)
+            original_index = old_translated_positions.get(identity_key)
+            if original_index is not None and \
+                    original_index in matched_sources:
+                continue
+            entry_candidates = []
+            if original_index is not None:
+                entry_candidates = [
+                    {
+                        'target': new_entries[target_index],
+                        'similarity': score,
+                    }
+                    for target_index, score in sorted(
+                        candidates.get(original_index, {}).items(),
+                        key=lambda item: (
+                            -item[1],
+                            _migration_identity_key(
+                                new_entries[item[0]]
+                            ),
+                        )
+                    )
+                ]
+            unmatched_old_entries.append({
+                'entry': identity,
+                'candidates': entry_candidates,
+            })
+        unmatched_new_entries = [
+            {
+                'entry': identity,
+                'candidates': [
+                    {
+                        'source': old_translated_identities[source_index],
+                        'similarity': rows[target_index],
+                    }
+                    for source_index, rows in sorted(
+                        candidates.items(),
+                        key=lambda item: _migration_identity_key(
+                            old_translated_identities[item[0]]
+                        )
+                    )
+                    for target_index in [
+                        new_target_positions[
+                            _migration_identity_key(identity)
+                        ]
+                    ]
+                    if target_index in rows
+                ],
+            }
+            for identity in new_entries
+            if new_target_positions[_migration_identity_key(identity)]
+            not in matched_targets
+        ]
+
+        return {
+            'version': 1,
+            'min_similarity': min_similarity,
+            'min_confidence': min_confidence,
+            'source_file_fingerprint': _migration_file_fingerprint(
+                self.fpath
+            ),
+            'template_file_fingerprint': _migration_file_fingerprint(
+                refpot.fpath
+            ),
+            'source_catalog_fingerprint': _migration_catalog_fingerprint(
+                self
+            ),
+            'template_catalog_fingerprint': _migration_catalog_fingerprint(
+                refpot
+            ),
+            'old_entries': old_entries,
+            'new_entries': new_entries,
+            'matches': matches,
+            'unmatched_old_entries': unmatched_old_entries,
+            'unmatched_new_entries': unmatched_new_entries,
+        }
+
+    def apply_translation_migration(self, refpot, plan, decisions=None):
+        """
+        Apply a migration plan and then perform the standard POT merge.
+
+        ``decisions`` maps either source or target entry fingerprints to a
+        boolean. A source fingerprint may also map to a target fingerprint to
+        select one specific candidate.
+        """
+        source_file_fingerprint = _migration_file_fingerprint(self.fpath)
+        if source_file_fingerprint != \
+                plan.get('source_file_fingerprint'):
+            raise ValueError(
+                'The source catalog has changed since the plan was created'
+            )
+        template_file_fingerprint = _migration_file_fingerprint(refpot.fpath)
+        if template_file_fingerprint != \
+                plan.get('template_file_fingerprint'):
+            raise ValueError(
+                'The reference template has changed since the plan was '
+                'created'
+            )
+        if _migration_catalog_fingerprint(self) != \
+                plan.get('source_catalog_fingerprint'):
+            raise ValueError(
+                'The source catalog has changed since the plan was created'
+            )
+        if _migration_catalog_fingerprint(refpot) != \
+                plan.get('template_catalog_fingerprint'):
+            raise ValueError(
+                'The reference template has changed since the plan was '
+                'created'
+            )
+
+        decisions = decisions or {}
+        chosen_targets = set(
+            decision for decision in decisions.values()
+            if not isinstance(decision, bool)
+        )
+        source_entries = dict(
+            (_migration_entry_identity(entry)['fingerprint'], entry)
+            for entry in self
+            if not entry.obsolete and entry.msgid != ''
+        )
+        target_entries = dict(
+            (_migration_entry_identity(entry)['fingerprint'], entry)
+            for entry in refpot
+            if not entry.obsolete and entry.msgid != ''
+        )
+        selected_sources = set()
+        selected_targets = set()
+        selected_matches = []
+        for match in plan.get('matches', []):
+            source_fingerprint = match['source']['fingerprint']
+            target_fingerprint = match['target']['fingerprint']
+            adopt = match.get('adopt', False)
+            if target_fingerprint in chosen_targets:
+                adopt = False
+            if source_fingerprint in decisions:
+                source_decision = decisions[source_fingerprint]
+                if isinstance(source_decision, bool):
+                    adopt = source_decision
+                else:
+                    adopt = source_decision == target_fingerprint
+            elif target_fingerprint in decisions:
+                adopt = decisions[target_fingerprint]
+            if adopt:
+                source = source_entries.get(source_fingerprint)
+                target = target_entries.get(target_fingerprint)
+                if source is None or target is None:
+                    raise ValueError(
+                        'The migration plan refers to an entry that no '
+                        'longer exists'
+                    )
+                if not _migration_compatible(source, target):
+                    raise ValueError(
+                        'The migration plan contains an incompatible match'
+                    )
+                if source_fingerprint in selected_sources or \
+                        target_fingerprint in selected_targets:
+                    raise ValueError(
+                        'The migration plan uses an entry more than once'
+                    )
+                selected_sources.add(source_fingerprint)
+                selected_targets.add(target_fingerprint)
+                selected_matches.append(match)
+
+        selected_sources_pre_merge = []
+        selected_targets_pre_merge = []
+        for match in selected_matches:
+            source = source_entries.get(
+                match['source']['fingerprint']
+            )
+            target = target_entries.get(
+                match['target']['fingerprint']
+            )
+            if source is None or target is None:
+                raise ValueError(
+                    'The migration plan refers to an entry that no longer '
+                    'exists'
+                )
+            selected_sources_pre_merge.append((
+                source,
+                source.msgctxt,
+                source.msgid,
+                source.msgid_plural,
+                source.msgstr,
+                source.msgstr_plural.copy(),
+            ))
+            selected_targets_pre_merge.append((
+                target.msgctxt,
+                target.msgid,
+                target.msgid_plural,
+                list(target.msgstr_plural.keys()),
+            ))
+
+        self.merge(refpot)
+
+        for migration, target_identity in zip(
+                selected_sources_pre_merge, selected_targets_pre_merge):
+            source, previous_msgctxt, previous_msgid, \
+                previous_msgid_plural, msgstr, msgstr_plural = migration
+            target_msgctxt, target_msgid, target_msgid_plural, \
+                target_plural_positions = target_identity
+            target_entry = None
+            for entry in self:
+                if entry.obsolete:
+                    continue
+                if (entry.msgctxt or None) == (target_msgctxt or None) and \
+                        entry.msgid == target_msgid and \
+                        entry.msgid_plural == target_msgid_plural:
+                    target_entry = entry
+                    break
+            if target_entry is None:
+                raise ValueError(
+                    'The migration plan refers to an entry that no longer '
+                    'exists'
+                )
+            target_entry.previous_msgctxt = previous_msgctxt or None
+            target_entry.previous_msgid = previous_msgid
+            target_entry.previous_msgid_plural = \
+                previous_msgid_plural or None
+            if target_msgid_plural:
+                target_entry.msgstr_plural = dict(
+                    (
+                        position,
+                        msgstr_plural.get(position, ''),
+                    )
+                    for position in target_plural_positions
+                )
+                for position in target_plural_positions:
+                    target_entry.msgstr_plural.setdefault(position, '')
+            else:
+                target_entry.msgstr = msgstr
+            target_entry.fuzzy = True
+            for index, entry in enumerate(self):
+                if entry is source:
+                    del self[index]
+                    break
+        return selected_matches
 # }}}
 # class MOFile {{{
 
