@@ -14,22 +14,38 @@ modify entries, comments or metadata, etc. or create new po files from scratch.
 
 import array
 import codecs
+import hashlib
+import json
 import os
 import re
 import struct
 import sys
 import textwrap
 import io
+from difflib import SequenceMatcher
 
 
 __author__ = 'David Jean Louis <izimobil@gmail.com>'
 __version__ = '1.2.0'
 __all__ = ['pofile', 'POFile', 'POEntry', 'mofile', 'MOFile', 'MOEntry',
-           'default_encoding', 'escape', 'unescape', 'detect_encoding', ]
+           'default_encoding', 'escape', 'unescape', 'detect_encoding',
+           'translation_migration_plan', 'apply_translation_migration_plan', ]
 
 
 # the default encoding to use when encoding cannot be detected
 default_encoding = 'utf-8'
+
+_MIGRATION_PLAN_VERSION = 1
+_PLACEHOLDER_PERCENT_RE = re.compile(
+    r'%(?:\((?P<named>[^)]*)\))?'
+    r'(?:(?P<numbered>\d+)\$)?'
+    r'[+#0\- ]*'
+    r'(?:(?P<width_star>\*)|\d+)?'
+    r'(?:\.(?:(?P<precision_star>\*)|\d+))?'
+    r'(?:hh?|ll?|[hlLzjt])?'
+    r'(?P<conversion>[diouxXeEfFgGcrsab])'
+)
+_PLACEHOLDER_BRACE_RE = re.compile(r'\{(?P<field>[^{}]*)\}')
 
 # python 2/3 compatibility helpers {{{
 
@@ -286,6 +302,321 @@ def natural_sort(lst):
         return [convert(c) for c in re.split('([0-9]+)', key)]
 
     return sorted(lst, key=alphanum_key)
+
+# }}}
+# translation migration helpers {{{
+
+
+def _migration_json(value):
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(',', ':')
+    )
+
+
+def _migration_digest(value):
+    data = _migration_json(value)
+    if isinstance(data, text_type):
+        data = data.encode('utf-8')
+    return hashlib.sha256(data).hexdigest()
+
+
+def _migration_identity(entry):
+    identity = [
+        entry.msgctxt,
+        entry.msgid,
+        entry.msgid_plural or None,
+    ]
+    return {
+        'msgctxt': entry.msgctxt,
+        'msgid': entry.msgid,
+        'msgid_plural': entry.msgid_plural or None,
+        'digest': _migration_digest(identity),
+    }
+
+
+def _catalog_fingerprint(catalog):
+    entries = []
+    for entry in catalog:
+        if entry.msgid == '':
+            continue
+        entries.append({
+            'msgctxt': entry.msgctxt,
+            'msgid': entry.msgid,
+            'msgid_plural': entry.msgid_plural or None,
+            'msgstr': entry.msgstr,
+            'msgstr_plural': sorted([
+                (key, value)
+                for key, value in entry.msgstr_plural.items()
+            ]),
+            'comment': entry.comment,
+            'tcomment': entry.tcomment,
+            'occurrences': [
+                list(occurrence) for occurrence in entry.occurrences
+            ],
+            'flags': list(entry.flags),
+            'obsolete': entry.obsolete,
+            'previous_msgctxt': entry.previous_msgctxt,
+            'previous_msgid': entry.previous_msgid,
+            'previous_msgid_plural': entry.previous_msgid_plural,
+        })
+    payload = {
+        'header': catalog.header,
+        'metadata': catalog.ordered_metadata(),
+        'metadata_is_fuzzy': catalog.metadata_is_fuzzy,
+        'entries': entries,
+    }
+    return _migration_digest(payload)
+
+
+def _has_translation(entry):
+    if entry.msgstr != '':
+        return True
+    return any(value != '' for value in entry.msgstr_plural.values())
+
+
+def _format_placeholders(text):
+    percent_auto = []
+    percent_numbered = []
+    percent_named = []
+    brace_positional = []
+    brace_named = []
+    position = 0
+    auto_brace = 0
+
+    while position < len(text):
+        if text.startswith('%%', position):
+            position += 2
+            continue
+        match = _PLACEHOLDER_PERCENT_RE.match(text, position)
+        if match:
+            conversion = match.group('conversion')
+            if match.group('named') is not None:
+                token = (match.group('named'), conversion)
+                percent_named.append(token)
+            elif match.group('numbered') is not None:
+                token = (int(match.group('numbered')), conversion)
+                percent_numbered.append(token)
+            else:
+                if match.group('width_star') is not None:
+                    percent_auto.append('*')
+                if match.group('precision_star') is not None:
+                    percent_auto.append('*')
+                percent_auto.append(conversion)
+            position = match.end()
+            continue
+
+        if text.startswith('{{', position) or text.startswith('}}', position):
+            position += 2
+            continue
+        match = _PLACEHOLDER_BRACE_RE.match(text, position)
+        if match:
+            field = match.group('field')
+            name = field
+            conversion = ''
+            spec = ''
+            if '!' in field:
+                name, suffix = field.split('!', 1)
+                conversion, _, spec = suffix.partition(':')
+            elif ':' in field:
+                name, spec = field.split(':', 1)
+            token = (conversion, spec)
+            if name == '':
+                brace_positional.append((auto_brace, token))
+                auto_brace += 1
+            elif name.isdigit():
+                brace_positional.append((int(name), token))
+            else:
+                brace_named.append((name, token))
+            position = match.end()
+            continue
+        position += 1
+
+    return {
+        'percent_auto': percent_auto,
+        'percent_numbered': sorted(percent_numbered),
+        'percent_named': sorted(percent_named),
+        'brace_positional': sorted(brace_positional),
+        'brace_named': sorted(brace_named),
+    }
+
+
+def _placeholders_are_compatible(source, target):
+    fields = [('msgid', 'msgid')]
+    if source.msgid_plural or target.msgid_plural:
+        fields.append(('msgid_plural', 'msgid_plural'))
+    for source_field, target_field in fields:
+        source_value = getattr(source, source_field) or ''
+        target_value = getattr(target, target_field) or ''
+        if _format_placeholders(source_value) != \
+                _format_placeholders(target_value):
+            return False
+    return True
+
+
+def _plural_shape_is_compatible(source, target):
+    return bool(source.msgid_plural) == bool(target.msgid_plural)
+
+
+def _candidate_is_compatible(source, target):
+    if source.msgctxt != target.msgctxt:
+        return False
+    if not _plural_shape_is_compatible(source, target):
+        return False
+    return _placeholders_are_compatible(source, target)
+
+
+def _migration_similarity(source, target):
+    def normalize(value):
+        return ' '.join(value.lower().split())
+
+    pairs = [(source.msgid, target.msgid)]
+    if source.msgid_plural and target.msgid_plural:
+        pairs.append((source.msgid_plural, target.msgid_plural))
+    scores = []
+    for source_value, target_value in pairs:
+        matcher = SequenceMatcher(
+            None,
+            normalize(source_value),
+            normalize(target_value)
+        )
+        scores.append(matcher.ratio())
+    return sum(scores) / len(scores)
+
+
+def _maximum_weight_matching(weights, source_count, target_count):
+    if source_count == 0 or target_count == 0 or not weights:
+        return {}
+
+    source_neighbors = {}
+    target_neighbors = {}
+    for source, target in weights:
+        source_neighbors.setdefault(source, set()).add(target)
+        target_neighbors.setdefault(target, set()).add(source)
+
+    visited_sources = set()
+    visited_targets = set()
+    matches = {}
+
+    for start_source in range(source_count):
+        if start_source in visited_sources or \
+                start_source not in source_neighbors:
+            continue
+        component_sources = set()
+        component_targets = set()
+        source_stack = [start_source]
+        target_stack = []
+        while source_stack or target_stack:
+            while source_stack:
+                source = source_stack.pop()
+                if source in component_sources:
+                    continue
+                component_sources.add(source)
+                for target in source_neighbors.get(source, set()):
+                    if target not in component_targets:
+                        target_stack.append(target)
+            while target_stack:
+                target = target_stack.pop()
+                if target in component_targets:
+                    continue
+                component_targets.add(target)
+                for source in target_neighbors.get(target, set()):
+                    if source not in component_sources:
+                        source_stack.append(source)
+
+        component_sources = sorted(component_sources)
+        component_targets = sorted(component_targets)
+        visited_sources.update(component_sources)
+        visited_targets.update(component_targets)
+        local_sources = dict(
+            (source, index)
+            for index, source in enumerate(component_sources)
+        )
+        local_targets = dict(
+            (target, index)
+            for index, target in enumerate(component_targets)
+        )
+        local_weights = {}
+        for source in component_sources:
+            for target in component_targets:
+                if (source, target) in weights:
+                    local_weights[
+                        (local_sources[source], local_targets[target])
+                    ] = weights[(source, target)]
+        matches.update(
+            _maximum_weight_matching_for_component(
+                local_weights,
+                len(component_sources),
+                len(component_targets),
+                component_sources,
+                component_targets
+            )
+        )
+    return matches
+
+
+def _maximum_weight_matching_for_component(weights, source_count,
+                                           target_count, source_ids,
+                                           target_ids):
+    size = max(source_count, target_count)
+    costs = [[1.0] * size for _ in range(size)]
+    for (source, target), score in weights.items():
+        costs[source][target] = 1.0 - score
+    inf = float('inf')
+    labels_x = [0.0] * (size + 1)
+    labels_y = [0.0] * (size + 1)
+    links = [0] * (size + 1)
+    way = [0] * (size + 1)
+
+    for source in range(1, size + 1):
+        links[0] = source
+        target = 0
+        minima = [inf] * (size + 1)
+        used = [False] * (size + 1)
+        while True:
+            used[target] = True
+            source = links[target]
+            delta = inf
+            next_target = 0
+            for candidate in range(1, size + 1):
+                if used[candidate]:
+                    continue
+                current = costs[source - 1][candidate - 1]
+                current -= labels_x[source] + labels_y[candidate]
+                if current < minima[candidate]:
+                    minima[candidate] = current
+                    way[candidate] = target
+                if minima[candidate] < delta:
+                    delta = minima[candidate]
+                    next_target = candidate
+            for candidate in range(size + 1):
+                if used[candidate]:
+                    labels_x[links[candidate]] += delta
+                    labels_y[candidate] -= delta
+                else:
+                    minima[candidate] -= delta
+            target = next_target
+            if links[target] == 0:
+                break
+        while True:
+            previous = way[target]
+            links[target] = links[previous]
+            target = previous
+            if target == 0:
+                break
+
+    matches = {}
+    for target in range(1, size + 1):
+        source = links[target]
+        source_index = source - 1
+        target_index = target - 1
+        if source and (source_index, target_index) in weights:
+            matches[source_ids[source_index]] = \
+                target_ids[target_index]
+    return matches
+
 
 # }}}
 # class _BaseFile {{{
@@ -715,6 +1046,26 @@ class POFile(_BaseFile):
         Convenience method that returns the list of obsolete entries.
         """
         return [e for e in self if e.obsolete]
+
+    def translation_migration_plan(self, refpot, similarity_threshold=0.5,
+                                   confidence_threshold=0.8):
+        """
+        Return a migration plan for translations of entries that disappeared
+        from this catalog and entries that are new in ``refpot``.
+        """
+        return translation_migration_plan(
+            self,
+            refpot,
+            similarity_threshold=similarity_threshold,
+            confidence_threshold=confidence_threshold
+        )
+
+    def apply_translation_migration_plan(self, refpot, plan):
+        """
+        Merge ``refpot`` and apply the approved translation matches from
+        ``plan``.
+        """
+        return apply_translation_migration_plan(self, refpot, plan)
 
     def merge(self, refpot):
         """
@@ -1200,6 +1551,277 @@ class POEntry(_BaseEntry):
 
     def __hash__(self):
         return hash((self.msgid, self.msgstr))
+# }}}
+# translation migration public functions {{{
+
+
+def translation_migration_plan(catalog, refpot,
+                               similarity_threshold=0.5,
+                               confidence_threshold=0.8):
+    """
+    Build a translation migration plan for changed message ids.
+
+    The plan is a plain JSON-serializable dictionary. Similarity is only used
+    as a candidate signal: context compatibility, plural compatibility and
+    format placeholder compatibility are hard requirements. Matches are
+    selected as a global one-to-one assignment. Only a unique assignment with
+    a score not below ``confidence_threshold`` is marked as approved.
+
+    Keyword arguments:
+
+    ``catalog``
+        POFile containing current translations.
+
+    ``refpot``
+        POFile containing the new message catalog.
+
+    ``similarity_threshold``
+        Minimum similarity for an edge to become a candidate.
+
+    ``confidence_threshold``
+        Minimum similarity for an edge to be applied without explicit caller
+        approval.
+    """
+    source_entries = [
+        entry for entry in catalog
+        if entry.msgid != '' and not entry.obsolete and _has_translation(entry)
+    ]
+    target_entries = [
+        entry for entry in refpot
+        if entry.msgid != '' and not entry.obsolete
+    ]
+    target_ids = set(entry.msgid_with_context for entry in target_entries)
+    existing_source_ids = set(
+        entry.msgid_with_context for entry in catalog
+        if entry.msgid != '' and not entry.obsolete
+    )
+
+    disappeared_sources = [
+        entry for entry in source_entries
+        if entry.msgid_with_context not in target_ids
+    ]
+    new_targets = [
+        entry for entry in target_entries
+        if entry.msgid_with_context not in existing_source_ids
+    ]
+
+    candidates = []
+    weights = {}
+    source_index = {}
+    target_index = {}
+    for source_position, source in enumerate(disappeared_sources):
+        source_index[source_position] = source
+        source_identity = _migration_identity(source)
+        for target_position, target in enumerate(new_targets):
+            target_index[target_position] = target
+            target_identity = _migration_identity(target)
+            if not _candidate_is_compatible(source, target):
+                continue
+            score = _migration_similarity(source, target)
+            if score < similarity_threshold:
+                continue
+            candidate = {
+                'source': source_identity,
+                'target': target_identity,
+                'score': score,
+            }
+            candidates.append(candidate)
+            weights[(source_position, target_position)] = score
+
+    candidates.sort(key=lambda candidate: (
+        -candidate['score'],
+        candidate['source']['digest'],
+        candidate['target']['digest'],
+    ))
+    assignment = _maximum_weight_matching(
+        weights, len(disappeared_sources), len(new_targets)
+    )
+
+    candidate_keys = set()
+    for candidate in candidates:
+        source_digest = candidate['source']['digest']
+        target_digest = candidate['target']['digest']
+        candidate_keys.add((source_digest, target_digest))
+
+    matches = []
+    assigned_sources = set()
+    assigned_targets = set()
+    for source_position, target_position in assignment.items():
+        source = source_index[source_position]
+        target = target_index[target_position]
+        source_identity = _migration_identity(source)
+        target_identity = _migration_identity(target)
+        source_digest = source_identity['digest']
+        target_digest = target_identity['digest']
+        score = weights[(source_position, target_position)]
+        source_tied = any(
+            abs(candidate['score'] - score) <= 1e-12
+            for candidate in candidates
+            if candidate['source']['digest'] == source_digest
+            and candidate['target']['digest'] != target_digest
+        )
+        target_tied = any(
+            abs(candidate['score'] - score) <= 1e-12
+            for candidate in candidates
+            if candidate['target']['digest'] == target_digest
+            and candidate['source']['digest'] != source_digest
+        )
+        approved = (
+            score >= confidence_threshold
+            and not source_tied
+            and not target_tied
+        )
+        reason = None
+        if score < confidence_threshold:
+            reason = 'low_confidence'
+        elif source_tied or target_tied:
+            reason = 'tied_score'
+        matches.append({
+            'source': source_identity,
+            'target': target_identity,
+            'score': score,
+            'approved': approved,
+            'reason': reason,
+        })
+        assigned_sources.add(source_digest)
+        assigned_targets.add(target_digest)
+
+    matches.sort(key=lambda match: (
+        -match['score'],
+        match['source']['digest'],
+        match['target']['digest'],
+    ))
+
+    return {
+        'version': _MIGRATION_PLAN_VERSION,
+        'source_fingerprint': _catalog_fingerprint(catalog),
+        'refpot_fingerprint': _catalog_fingerprint(refpot),
+        'similarity_threshold': similarity_threshold,
+        'confidence_threshold': confidence_threshold,
+        'candidates': candidates,
+        'matches': matches,
+        'unmatched_sources': [
+            _migration_identity(entry)
+            for entry in disappeared_sources
+            if _migration_identity(entry)['digest'] not in assigned_sources
+        ],
+        'unmatched_targets': [
+            _migration_identity(entry)
+            for entry in new_targets
+            if _migration_identity(entry)['digest'] not in assigned_targets
+        ],
+    }
+
+
+def apply_translation_migration_plan(catalog, refpot, plan):
+    """
+    Merge ``refpot`` and apply approved matches from a migration plan.
+
+    The source catalog and reference catalog fingerprints in the plan must
+    match their current contents. Approved translations are marked fuzzy and
+    receive previous message identity fields. Disapproved old entries are left
+    for :meth:`POFile.merge` to obsolete.
+    """
+    if not isinstance(plan, dict):
+        raise ValueError('Invalid migration plan')
+    if plan.get('version') != _MIGRATION_PLAN_VERSION:
+        raise ValueError('Unsupported migration plan version')
+    if plan.get('source_fingerprint') != _catalog_fingerprint(catalog):
+        raise ValueError('Source catalog changed after migration planning')
+    if plan.get('refpot_fingerprint') != _catalog_fingerprint(refpot):
+        raise ValueError('Reference catalog changed after migration planning')
+
+    sources_by_digest = {}
+    for entry in catalog:
+        if entry.msgid != '' and not entry.obsolete:
+            sources_by_digest[_migration_identity(entry)['digest']] = entry
+    targets_by_digest = {}
+    for entry in refpot:
+        if entry.msgid != '' and not entry.obsolete:
+            targets_by_digest[_migration_identity(entry)['digest']] = entry
+
+    candidate_edges = set()
+    for candidate in plan.get('candidates', []):
+        source_digest = candidate['source']['digest']
+        target_digest = candidate['target']['digest']
+        candidate_edges.add((source_digest, target_digest))
+
+    approved_matches = [
+        match for match in plan.get('matches', [])
+        if match.get('approved')
+    ]
+    approved_sources = [
+        match['source']['digest'] for match in approved_matches
+    ]
+    approved_targets = [
+        match['target']['digest'] for match in approved_matches
+    ]
+    if len(approved_sources) != len(set(approved_sources)):
+        raise ValueError('Migration plan uses a source more than once')
+    if len(approved_targets) != len(set(approved_targets)):
+        raise ValueError('Migration plan uses a target more than once')
+
+    for match in approved_matches:
+        source_digest = match['source']['digest']
+        target_digest = match['target']['digest']
+        if (source_digest, target_digest) not in candidate_edges:
+            raise ValueError('Migration plan contains an unknown candidate')
+        if source_digest not in sources_by_digest:
+            raise ValueError('Migration plan source is not available')
+        if target_digest not in targets_by_digest:
+            raise ValueError('Migration plan target is not available')
+        source = sources_by_digest[source_digest]
+        planned_target = targets_by_digest[target_digest]
+        if not _candidate_is_compatible(source, planned_target):
+            raise ValueError('Migration plan candidate is incompatible')
+
+    catalog.merge(refpot)
+
+    merged_sources = {}
+    merged_targets = {}
+    for entry in catalog:
+        if entry.msgid == '':
+            continue
+        identity = _migration_identity(entry)
+        digest = identity['digest']
+        if entry.obsolete:
+            merged_sources[digest] = entry
+        else:
+            merged_targets[digest] = entry
+
+    obsolete_sources = []
+    for match in approved_matches:
+        source_digest = match['source']['digest']
+        target_digest = match['target']['digest']
+        source = merged_sources.get(source_digest)
+        target = merged_targets.get(target_digest)
+        if source is None or target is None:
+            raise ValueError('Migration plan cannot be applied after merge')
+
+        target.msgstr = source.msgstr
+        if target.msgid_plural:
+            for position in sorted(source.msgstr_plural):
+                if position in target.msgstr_plural:
+                    target.msgstr_plural[position] = \
+                        source.msgstr_plural[position]
+        else:
+            target.msgstr_plural = {}
+        target.fuzzy = True
+        target.tcomment = source.tcomment
+        target.previous_msgctxt = source.msgctxt
+        target.previous_msgid = source.msgid
+        target.previous_msgid_plural = source.msgid_plural or None
+        obsolete_sources.append(source)
+
+    for source in obsolete_sources:
+        for index, entry in enumerate(catalog):
+            if entry is source:
+                del catalog[index]
+                break
+
+    return catalog
+
+
 # }}}
 # class MOEntry {{{
 

@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import codecs
+import json
 import os
 import subprocess
 import sys
@@ -694,6 +695,253 @@ class TestPoFile(unittest.TestCase):
         po.merge(refpot)
         expected_po = polib.pofile('tests/test_merge_after.po')
         self.assertEqual(po, expected_po)
+
+    def test_translation_migration_plan_global_matching(self):
+        refpot = polib.POFile()
+        for msgid in [
+            'Save the file before closing the window now.',
+            'Please save the file before closing it.',
+        ]:
+            refpot.append(polib.POEntry(msgid=msgid))
+        po = polib.POFile()
+        for msgid, msgstr in [
+            ('Please save the file before closing the window.', 'window'),
+            ('Save the file before closing it, please.', 'it'),
+        ]:
+            po.append(polib.POEntry(msgid=msgid, msgstr=msgstr))
+
+        plan = po.translation_migration_plan(
+            refpot,
+            confidence_threshold=0.6
+        )
+
+        self.assertEqual(len(plan['matches']), 2)
+        self.assertEqual(
+            plan['candidates'][0]['source']['msgid'],
+            'Please save the file before closing the window.'
+        )
+        self.assertEqual(
+            plan['candidates'][0]['target']['msgid'],
+            'Please save the file before closing it.'
+        )
+        matches = [
+            (
+                match['source']['msgid'],
+                match['target']['msgid'],
+                match['approved'],
+            )
+            for match in plan['matches']
+        ]
+        self.assertEqual(matches, [
+            (
+                'Please save the file before closing the window.',
+                'Save the file before closing the window now.',
+                True,
+            ),
+            (
+                'Save the file before closing it, please.',
+                'Please save the file before closing it.',
+                True,
+            ),
+        ])
+        self.assertEqual(
+            len(set(match['source']['digest']
+                    for match in plan['matches'])),
+            2
+        )
+        self.assertEqual(
+            len(set(match['target']['digest']
+                    for match in plan['matches'])),
+            2
+        )
+
+    def test_translation_migration_plan_is_stable(self):
+        def catalogs():
+            refpot = polib.POFile()
+            refpot.append(polib.POEntry(msgid='New message'))
+            po = polib.POFile()
+            po.append(polib.POEntry(msgid='Old message', msgstr='old'))
+            return po, refpot
+
+        first = json.dumps(
+            catalogs()[0].translation_migration_plan(catalogs()[1]),
+            sort_keys=True
+        )
+        second = json.dumps(
+            catalogs()[0].translation_migration_plan(catalogs()[1]),
+            sort_keys=True
+        )
+        self.assertEqual(first, second)
+
+    def test_apply_translation_migration_plan(self):
+        refpot = polib.POFile()
+        refpot.append(polib.POEntry(msgid='Save this file now.'))
+        refpot.append(polib.POEntry(msgid='Unrelated new message.'))
+        po = polib.POFile()
+        po.append(polib.POEntry(
+            msgid='Save the file now.',
+            msgstr='sauvegarde'
+        ))
+        po.append(polib.POEntry(msgid='Lost message.', msgstr='perdue'))
+        plan = po.translation_migration_plan(
+            refpot,
+            similarity_threshold=0.5,
+            confidence_threshold=0.95
+        )
+        match = plan['matches'][0]
+        self.assertEqual(match['approved'], False)
+        self.assertEqual(match['reason'], 'low_confidence')
+        match['approved'] = True
+
+        po.apply_translation_migration_plan(refpot, plan)
+
+        migrated = po.find('Save this file now.')
+        self.assertEqual(migrated.msgstr, 'sauvegarde')
+        self.assertTrue(migrated.fuzzy)
+        self.assertEqual(migrated.previous_msgid, 'Save the file now.')
+        self.assertEqual(migrated.previous_msgctxt, None)
+        self.assertTrue(po.find('Unrelated new message.') is not None)
+        lost = po.find('Lost message.', include_obsolete_entries=True)
+        self.assertTrue(lost.obsolete)
+
+    def test_translation_migration_requires_compatible_context(self):
+        refpot = polib.POFile()
+        refpot.append(polib.POEntry(msgctxt='new', msgid='Save the file.'))
+        po = polib.POFile()
+        po.append(polib.POEntry(
+            msgctxt='old',
+            msgid='Save the file.',
+            msgstr='sauvegarde'
+        ))
+
+        plan = po.translation_migration_plan(refpot)
+
+        self.assertEqual(plan['candidates'], [])
+        self.assertEqual(len(plan['matches']), 0)
+
+    def test_translation_migration_requires_compatible_placeholders(self):
+        refpot = polib.POFile()
+        refpot.append(polib.POEntry(msgid='Saved %s to disk.'))
+        po = polib.POFile()
+        po.append(polib.POEntry(
+            msgid='Saved %d to disk.',
+            msgstr='sauvegarde'
+        ))
+
+        plan = po.translation_migration_plan(refpot)
+
+        self.assertEqual(plan['candidates'], [])
+
+    def test_translation_migration_requires_compatible_plural_shape(self):
+        refpot = polib.POFile()
+        refpot.append(polib.POEntry(
+            msgid='One file.',
+            msgid_plural='Many files.',
+            msgstr_plural={0: '', 1: ''}
+        ))
+        po = polib.POFile()
+        po.append(polib.POEntry(msgid='One file.', msgstr='fichier'))
+
+        plan = po.translation_migration_plan(refpot)
+
+        self.assertEqual(plan['candidates'], [])
+
+    def test_translation_migration_accepts_changed_plural_forms(self):
+        refpot = polib.POFile()
+        refpot.append(polib.POEntry(
+            msgid='File removed.',
+            msgid_plural='Files removed.',
+            msgstr_plural={0: '', 1: '', 2: ''}
+        ))
+        po = polib.POFile()
+        po.append(polib.POEntry(
+            msgid='File deleted.',
+            msgid_plural='Files deleted.',
+            msgstr_plural={0: 'fichier supprimé', 1: 'fichiers supprimés'}
+        ))
+
+        plan = po.translation_migration_plan(
+            refpot,
+            confidence_threshold=0.6
+        )
+        po.apply_translation_migration_plan(refpot, plan)
+
+        migrated = po.find('File removed.')
+        self.assertTrue(migrated.fuzzy)
+        self.assertEqual(
+            migrated.previous_msgid_plural,
+            'Files deleted.'
+        )
+        self.assertEqual(migrated.msgstr_plural, {
+            0: 'fichier supprimé',
+            1: 'fichiers supprimés',
+            2: '',
+        })
+
+    def test_translation_migration_leaves_tied_candidates_to_caller(self):
+        refpot = polib.POFile()
+        refpot.append(polib.POEntry(msgid='Save this file.'))
+        refpot.append(polib.POEntry(msgid='Save that file.'))
+        po = polib.POFile()
+        po.append(polib.POEntry(msgid='Save the file.', msgstr='fichier'))
+
+        plan = po.translation_migration_plan(refpot)
+
+        self.assertEqual(len(plan['matches']), 1)
+        self.assertEqual(plan['matches'][0]['approved'], False)
+        self.assertEqual(plan['matches'][0]['reason'], 'tied_score')
+        plan['matches'][0]['approved'] = True
+        po.apply_translation_migration_plan(refpot, plan)
+
+        target = po.find('Save this file.')
+        self.assertEqual(target.msgstr, 'fichier')
+        self.assertTrue(target.fuzzy)
+        self.assertEqual(po.find('Save that file.').msgstr, '')
+
+    def test_apply_translation_migration_plan_checks_fingerprints(self):
+        refpot = polib.POFile()
+        refpot.append(polib.POEntry(msgid='Save this file now.'))
+        po = polib.POFile()
+        po.append(polib.POEntry(msgid='Save the file now.', msgstr='old'))
+        plan = po.translation_migration_plan(refpot)
+
+        po[0].msgstr = 'changed'
+        self.assertRaises(
+            ValueError,
+            po.apply_translation_migration_plan,
+            refpot,
+            plan
+        )
+
+    def test_apply_translation_migration_plan_rejects_reused_source(self):
+        refpot = polib.POFile()
+        refpot.append(polib.POEntry(msgid='Save this file.'))
+        refpot.append(polib.POEntry(msgid='Save that file.'))
+        po = polib.POFile()
+        po.append(polib.POEntry(msgid='Save the file.', msgstr='fichier'))
+        plan = po.translation_migration_plan(refpot)
+        plan['matches'].append(dict(plan['matches'][0]))
+        plan['matches'][0]['approved'] = True
+        plan['matches'][1]['approved'] = True
+        plan['matches'][1]['target'] = dict(
+            plan['matches'][1]['source']
+        )
+
+        self.assertRaises(
+            ValueError,
+            po.apply_translation_migration_plan,
+            refpot,
+            plan
+        )
+
+        po[0].msgstr = 'old'
+        refpot[0].msgid = 'Another new message.'
+        self.assertRaises(
+            ValueError,
+            po.apply_translation_migration_plan,
+            refpot,
+            plan
+        )
 
     def test_percent_translated(self):
         po = polib.pofile('tests/test_pofile_helpers.po')
