@@ -14,6 +14,9 @@ modify entries, comments or metadata, etc. or create new po files from scratch.
 
 import array
 import codecs
+import copy
+import hashlib
+import json
 import os
 import re
 import struct
@@ -26,6 +29,14 @@ __author__ = 'David Jean Louis <izimobil@gmail.com>'
 __version__ = '1.2.0'
 __all__ = ['pofile', 'POFile', 'POEntry', 'mofile', 'MOFile', 'MOEntry',
            'default_encoding', 'escape', 'unescape', 'detect_encoding', ]
+__all__.extend([
+    'split_pofile', 'collect_pofile',
+    'PO_ASSIGNMENT_MANIFEST_VERSION',
+    'PO_ASSIGNMENT_MANIFEST_FILENAME',
+])
+
+PO_ASSIGNMENT_MANIFEST_VERSION = 1
+PO_ASSIGNMENT_MANIFEST_FILENAME = 'polib-assignment-manifest.json'
 
 
 # the default encoding to use when encoding cannot be detected
@@ -92,6 +103,9 @@ def _is_file(filename_or_contents):
         either a filename, or a string holding the contents of some file.
         In the latter case, this function will always return False.
     """
+    if not isinstance(filename_or_contents, (str, bytes) if PY3
+                      else (basestring,)):
+        return False
     try:
         return os.path.isfile(filename_or_contents)
     except (TypeError, ValueError, UnicodeEncodeError):
@@ -748,6 +762,847 @@ class POFile(_BaseFile):
         for entry in self:
             if entry.msgid_with_context not in refpot_msgids:
                 entry.obsolete = True
+
+
+def split_pofile(source_path, output_dir, group_for_entry, groups=None,
+                 manifest_path=PO_ASSIGNMENT_MANIFEST_FILENAME,
+                 filename_template='{group}.po', unassigned_groups=None,
+                 wrapwidth=78):
+    """
+    Split a PO catalog into one or more team packages.
+
+    ``group_for_entry`` is called once for each non-header entry. It receives
+    a :class:`POEntry` and must return a group name, an iterable of group
+    names, or ``None``. Groups can inspect ``entry.occurrences`` to allocate
+    work by source path. Returning several groups puts the same original entry
+    in several packages; the manifest keeps the shared identity.
+
+    The function writes one PO file per group and a JSON manifest. It returns
+    the manifest as a dictionary.
+    """
+    source_path = os.fspath(source_path) if hasattr(os, 'fspath') else source_path
+    if not os.path.isfile(source_path):
+        raise IOError('PO file not found: %s' % source_path)
+
+    source_bytes = _read_binary_file(source_path)
+    source_checksum = _sha256(source_bytes)
+    source = pofile(source_path, wrapwidth=wrapwidth)
+    source_metadata = _source_compatibility(source)
+
+    if unassigned_groups is None:
+        unassigned_groups = []
+    if groups is None:
+        explicit_groups = None
+        resolved_groups = set()
+    else:
+        explicit_groups = True
+        resolved_groups = set(_validate_group_name(group) for group in groups)
+
+    assignments = []
+    seen_identities = set()
+    grouped_entries = {}
+
+    for index, entry in enumerate(source):
+        identity = _entry_identity(entry)
+        if identity in seen_identities:
+            raise ValueError('Duplicate PO identity: %s' % identity)
+        seen_identities.add(identity)
+
+        if entry.msgid_plural and source_metadata['plural_forms']:
+            _validate_plural_entry(entry, source_metadata['plural_forms'])
+
+        entry_groups = _groups_for_entry(group_for_entry, entry,
+                                         unassigned_groups,
+                                         resolved_groups if explicit_groups
+                                         else None)
+        for group in entry_groups:
+            _validate_group_name(group)
+            resolved_groups.add(group)
+            grouped_entries.setdefault(group, []).append(entry)
+
+        assignments.append({
+            'identity': identity,
+            'index': index,
+            'msgctxt': entry.msgctxt,
+            'msgid': entry.msgid,
+            'msgid_plural': entry.msgid_plural,
+            'translation': _translation_as_json(entry),
+            'occurrences': _occurrences_as_json(entry.occurrences),
+            'groups': sorted(set(entry_groups)),
+        })
+
+    ordered_groups = sorted(resolved_groups)
+    if explicit_groups and not ordered_groups:
+        raise ValueError('At least one group is required')
+
+    output_dir = os.path.abspath(output_dir)
+    if not os.path.isdir(output_dir):
+        os.makedirs(output_dir)
+    manifest_abs_path = _resolve_manifest_path(output_dir, manifest_path)
+    if os.path.abspath(manifest_abs_path) == os.path.abspath(source_path):
+        raise ValueError('The manifest path must not be the source PO file')
+
+    group_records = []
+    package_paths = set()
+    for group in ordered_groups:
+        package_rel_path = filename_template.format(group=group)
+        package_path = os.path.join(output_dir, package_rel_path)
+        _ensure_within_directory(output_dir, package_path)
+        if package_path in package_paths:
+            raise ValueError('Package file name template resolves duplicate paths')
+        package_paths.add(package_path)
+        if os.path.abspath(package_path) == os.path.abspath(source_path):
+            raise ValueError('A package path must not be the source PO file')
+        if os.path.abspath(package_path) == manifest_abs_path:
+            raise ValueError('A package path must not be the manifest')
+
+        package_directory = os.path.dirname(package_path)
+        if not os.path.isdir(package_directory):
+            os.makedirs(package_directory)
+        package = _new_catalog_like(source)
+        for entry in grouped_entries.get(group, []):
+            package.append(copy.deepcopy(entry))
+        package.save(package_path)
+        group_records.append({
+            'name': group,
+            'file': package_rel_path.replace(os.sep, '/'),
+            'entry_count': len(grouped_entries.get(group, [])),
+        })
+
+    source_path_abs = os.path.abspath(source_path)
+    manifest = {
+        'version': PO_ASSIGNMENT_MANIFEST_VERSION,
+        'source': {
+            'path': source_path,
+            'absolute_path': source_path_abs,
+            'relative_path': os.path.relpath(source_path_abs, output_dir),
+            'checksum_sha256': source_checksum,
+            'size': len(source_bytes),
+        },
+        'encoding': source.encoding,
+        'language': source_metadata['language'],
+        'plural_forms': source_metadata['plural_forms'],
+        'header': source.header,
+        'metadata': source.ordered_metadata(),
+        'metadata_is_fuzzy': list(source.metadata_is_fuzzy),
+        'wrapwidth': wrapwidth,
+        'source_directories': _source_directories(source),
+        'occurrence_paths': _occurrence_paths(source),
+        'groups': group_records,
+        'assignments': assignments,
+    }
+    _write_json(manifest_abs_path, manifest)
+    return manifest
+
+
+def collect_pofile(manifest, output_path, report_path=None, wrapwidth=None):
+    """
+    Collect team packages described by ``manifest`` into one release catalog.
+
+    ``manifest`` may be a manifest path or the dictionary returned by
+    :func:`split_pofile`. Translation conflicts are never resolved by package
+    file order: conflicting entries retain the source translation and are
+    listed in the returned report. Comments, occurrences and flags are merged
+    as sorted, de-duplicated unions.
+
+    The return value contains the output path, report path, per-entry statuses
+    and all compatibility/missing-package/source-change reports.
+    """
+    manifest_dir = '.'
+    manifest_file_path = None
+    if not isinstance(manifest, dict):
+        manifest_path = os.fspath(manifest) if hasattr(os, 'fspath') else manifest
+        with io.open(manifest_path, 'r', encoding='utf-8') as handle:
+            manifest = json.load(handle)
+        manifest_file_path = os.path.abspath(manifest_path)
+        manifest_dir = os.path.dirname(manifest_file_path)
+
+    _validate_manifest(manifest)
+    output_path = os.path.abspath(output_path)
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        if not os.path.isdir(output_dir):
+            os.makedirs(output_dir)
+    if report_path is None:
+        report_path = os.path.splitext(output_path)[0] + '.report.json'
+    report_path = os.path.abspath(report_path)
+
+    source_path = _resolve_source_path(manifest, manifest_dir)
+    source = None
+    source_checksum = None
+    reports = []
+    source_changed = False
+    source_missing = False
+
+    if source_path and os.path.isfile(source_path):
+        source_bytes = _read_binary_file(source_path)
+        source_checksum = _sha256(source_bytes)
+        if source_checksum != manifest['source']['checksum_sha256']:
+            source_changed = True
+            reports.append(_report(
+                'source-changed',
+                'The source PO catalog changed after splitting.',
+                source_path=source_path
+            ))
+        source = pofile(source_path, wrapwidth=manifest.get('wrapwidth', 78))
+        actual_directories = _source_directories(source)
+        if actual_directories != manifest['source_directories']:
+            reports.append(_report(
+                'source-directories-changed',
+                'Occurrence source directories no longer match the manifest.',
+                expected=manifest['source_directories'],
+                actual=actual_directories
+            ))
+    else:
+        source_missing = True
+        reports.append(_report(
+            'source-missing',
+            'The source PO catalog used for splitting is unavailable.',
+            source_path=source_path
+        ))
+
+    source_entries = {}
+    if source is not None:
+        for entry in source:
+            identity = _entry_identity(entry)
+            if identity in source_entries:
+                reports.append(_report(
+                    'duplicate-source-identity',
+                    'The changed source catalog contains a duplicate identity.',
+                    identity=identity
+                ))
+            else:
+                source_entries[identity] = entry
+
+    expected_identities = [item['identity'] for item in manifest['assignments']]
+    expected_set = set(expected_identities)
+    for identity in sorted(set(source_entries) - expected_set):
+        reports.append(_report(
+            'source-entry-added',
+            'The changed source catalog contains an entry absent from the manifest.',
+            identity=identity
+        ))
+
+    package_copies = {}
+    package_status = {}
+    group_records = dict((record['name'], record)
+                         for record in manifest['groups'])
+    for group_record in manifest['groups']:
+        group = group_record['name']
+        package_rel_path = group_record['file']
+        package_path = os.path.join(manifest_dir, package_rel_path)
+        _ensure_within_directory(manifest_dir, package_path)
+        if not os.path.isfile(package_path):
+            package_status[group] = 'missing'
+            reports.append(_report(
+                'package-missing',
+                'An assigned team package is missing.',
+                group=group,
+                path=package_rel_path
+            ))
+            continue
+
+        package = pofile(package_path,
+                         wrapwidth=manifest.get('wrapwidth', 78))
+        compatibility = _package_compatibility(package, manifest)
+        for issue in compatibility:
+            issue['group'] = group
+            reports.append(issue)
+
+        entries = {}
+        for entry in package:
+            identity = _entry_identity(entry)
+            if identity not in expected_set:
+                reports.append(_report(
+                    'package-unknown-entry',
+                    'A package contains an identity absent from the manifest.',
+                    group=group,
+                    identity=identity
+                ))
+                continue
+            if identity in entries:
+                reports.append(_report(
+                    'duplicate-package-identity',
+                    'A package contains the same identity more than once.',
+                    group=group,
+                    identity=identity
+                ))
+                continue
+            entries[identity] = entry
+        package_copies[group] = entries
+        package_status[group] = 'present'
+
+    result = _new_catalog_from_manifest(manifest, wrapwidth)
+    entry_statuses = []
+    manifest_entries = dict((item['identity'], item)
+                            for item in manifest['assignments'])
+
+    for assignment in manifest['assignments']:
+        identity = assignment['identity']
+        source_entry = source_entries.get(identity)
+        if source is not None and source_entry is None:
+            reports.append(_report(
+                'source-entry-missing',
+                'The changed source catalog no longer contains a manifest entry.',
+                identity=identity
+            ))
+
+        merged_entry, decision = _merged_entry(
+            assignment, source_entry, manifest, package_copies, reports
+        )
+        result.append(merged_entry)
+
+        copies = []
+        for group in [record['name'] for record in manifest['groups']]:
+            if group in package_copies and identity in package_copies[group]:
+                copies.append(group)
+        if source is not None and source_entry is not None:
+            actual_occurrences = _occurrences_as_json(source_entry.occurrences)
+            if actual_occurrences != assignment['occurrences']:
+                reports.append(_report(
+                    'source-occurrences-changed',
+                    'An entry occurrence changed after splitting.',
+                    identity=identity,
+                    expected=assignment['occurrences'],
+                    actual=actual_occurrences
+                ))
+
+        entry_statuses.append({
+            'identity': identity,
+            'msgctxt': assignment['msgctxt'],
+            'msgid': assignment['msgid'],
+            'msgid_plural': assignment['msgid_plural'],
+            'status': decision['status'],
+            'groups': copies,
+        })
+
+    if source_path and os.path.abspath(output_path) == os.path.abspath(source_path):
+        raise ValueError('The output path must not be the source PO file')
+    if source_path and report_path == os.path.abspath(source_path):
+        raise ValueError('The report path must not be the source PO file')
+    if report_path == output_path:
+        raise ValueError('The report path must not be the release PO file')
+    if manifest_file_path and output_path == manifest_file_path:
+        raise ValueError('The output path must not be the assignment manifest')
+    if manifest_file_path and report_path == manifest_file_path:
+        raise ValueError('The report path must not be the assignment manifest')
+    package_paths = set()
+    for record in manifest['groups']:
+        package_paths.add(os.path.abspath(
+            os.path.join(manifest_dir, record['file'])
+        ))
+    if output_path in package_paths:
+        raise ValueError('The output path must not overwrite a team package')
+    if report_path in package_paths:
+        raise ValueError('The report path must not overwrite a team package')
+
+    result.save(output_path)
+    report = {
+        'version': PO_ASSIGNMENT_MANIFEST_VERSION,
+        'source_path': source_path,
+        'source_checksum_sha256': source_checksum,
+        'source_changed': source_changed,
+        'source_missing': source_missing,
+        'packages': package_status,
+        'entries': entry_statuses,
+        'reports': reports,
+        'conflicts': [issue for issue in reports
+                     if issue['code'] == 'translation-conflict'],
+    }
+    _write_json(report_path, report)
+    report['output_path'] = output_path
+    report['report_path'] = report_path
+    return report
+
+
+def _read_binary_file(path):
+    with open(path, 'rb') as handle:
+        return handle.read()
+
+
+def _write_json(path, data):
+    directory = os.path.dirname(os.path.abspath(path))
+    if not os.path.isdir(directory):
+        os.makedirs(directory)
+    contents = json.dumps(
+        data, sort_keys=True, indent=2, ensure_ascii=False
+    ) + u('\n')
+    with io.open(path, 'w', encoding='utf-8', newline='\n') as handle:
+        handle.write(contents)
+
+
+def _sha256(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def _resolve_manifest_path(output_dir, manifest_path):
+    if os.path.isabs(manifest_path):
+        return manifest_path
+    return os.path.join(output_dir, manifest_path)
+
+
+def _resolve_source_path(manifest, manifest_dir):
+    source = manifest['source']
+    absolute_path = source.get('absolute_path')
+    if absolute_path and os.path.isfile(absolute_path):
+        return absolute_path
+    relative_path = source.get('relative_path')
+    if relative_path:
+        candidate = os.path.abspath(os.path.join(manifest_dir, relative_path))
+        if os.path.isfile(candidate):
+            return candidate
+    path = source.get('path')
+    if path and os.path.isabs(path):
+        return path
+    return absolute_path or path or None
+
+
+def _validate_group_name(group):
+    if not isinstance(group, str if PY3 else basestring):
+        raise ValueError('Group names must be strings')
+    group = text_type(group)
+    if not group:
+        raise ValueError('Group names must not be empty')
+    if group in ('.', '..') or group.startswith('.') or os.sep in group or \
+       (os.altsep and os.altsep in group) or group.startswith('/'):
+        raise ValueError('Invalid group name: %s' % group)
+    if any(char in group for char in '\0\r\n'):
+        raise ValueError('Invalid group name: %s' % group)
+    return group
+
+
+def _groups_for_entry(group_for_entry, entry, unassigned_groups,
+                      allowed_groups=None):
+    result = group_for_entry(entry)
+    if result is None:
+        result = unassigned_groups
+    elif isinstance(result, str if PY3 else basestring):
+        result = [result]
+    groups = [_validate_group_name(group) for group in result]
+    if not groups:
+        return []
+    if allowed_groups is not None:
+        for group in groups:
+            if group not in allowed_groups:
+                raise ValueError('Entry assigned to undeclared group: %s' %
+                                 group)
+    return sorted(set(groups))
+
+
+def _ensure_within_directory(directory, path):
+    directory = os.path.abspath(directory)
+    path = os.path.abspath(path)
+    relative = os.path.relpath(path, directory)
+    escapes = relative == os.pardir or \
+        relative.startswith(os.pardir + os.sep)
+    if os.path.altsep:
+        escapes = escapes or relative.startswith(os.pardir + os.altsep)
+    if escapes:
+        raise ValueError('Path escapes its containing directory')
+    return path
+
+
+def _entry_identity(entry):
+    payload = (
+        entry.msgctxt,
+        entry.msgid,
+        entry.msgid_plural,
+        bool(entry.msgid_plural or entry.msgstr_plural)
+    )
+    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                            separators=(',', ':'))
+    if not PY3 and isinstance(serialized, str):
+        serialized = serialized.decode('utf-8')
+    return hashlib.sha256(serialized.encode('utf-8')).hexdigest()
+
+
+def _occurrences_as_json(occurrences):
+    return [[path, text_type(line)] for path, line in occurrences]
+
+
+def _translation_as_json(entry):
+    if entry.msgid_plural:
+        return dict((text_type(index), value)
+                    for index, value in entry.msgstr_plural.items())
+    return entry.msgstr
+
+
+def _translation_as_json_payload(payload):
+    if isinstance(payload, dict):
+        return dict((text_type(index), value)
+                    for index, value in payload.items())
+    return payload
+
+
+def _source_directories(pofile):
+    directories = set()
+    for entry in pofile:
+        for path, line in entry.occurrences:
+            directory = os.path.dirname(path)
+            if directory:
+                directories.add(directory)
+    return sorted(directories)
+
+
+def _occurrence_paths(pofile):
+    paths = set()
+    for entry in pofile:
+        for path, line in entry.occurrences:
+            paths.add(path)
+    return sorted(paths)
+
+
+def _canonical_charset(encoding):
+    if not encoding:
+        return None
+    try:
+        return codecs.lookup(encoding).name.lower()
+    except LookupError:
+        return None
+
+
+def _content_type_charset(pofile):
+    content_type = pofile.metadata.get('Content-Type', '')
+    match = re.search(r'charset=([^;\s]+)', content_type, re.I)
+    if not match:
+        return None
+    return match.group(1)
+
+
+def _normalize_language(language):
+    if not language:
+        return None
+    normalized = language.strip().replace('_', '-')
+    normalized = re.sub(r'[^A-Za-z0-9-]', '-', normalized)
+    parts = normalized.split('-')
+    if not parts or not parts[0] or not parts[0].isalpha():
+        return None
+    return '-'.join(
+        [parts[0].lower()] +
+        [part.upper() if len(part) == 2 and index == 1 else
+         part[0].upper() + part[1:].lower() if part.isalpha() else part
+          for index, part in enumerate(parts[1:])]
+    )
+
+
+def _parse_plural_forms(value):
+    if not value:
+        return None
+    nplurals_match = re.search(r'nplurals\s*=\s*([0-9]+)\s*;', value)
+    plural_match = re.search(r'plural\s*=\s*(.*?)\s*;?\s*$', value,
+                             re.S | re.I)
+    if not nplurals_match or not plural_match:
+        raise ValueError('Invalid Plural-Forms header: %s' % value)
+    nplurals = int(nplurals_match.group(1))
+    expression = plural_match.group(1).strip()
+    if nplurals < 1 or not expression or expression.count('(') != \
+       expression.count(')'):
+        raise ValueError('Invalid Plural-Forms header: %s' % value)
+    if not re.match(r'^[0-9n()?:<>=!&|% \t\r\n+\-*/.]+$', expression):
+        raise ValueError('Unsupported Plural-Forms expression: %s' % expression)
+    return {
+        'raw': value,
+        'nplurals': nplurals,
+        'expression': re.sub(r'\s+', ' ', expression),
+    }
+
+
+def _validate_plural_entry(entry, plural_forms):
+    keys = set(entry.msgstr_plural.keys())
+    expected = set(range(plural_forms['nplurals']))
+    if keys != expected:
+        raise ValueError(
+            'Plural entry "%s" uses %d forms, Plural-Forms declares %d' %
+            (entry.msgid, len(keys), plural_forms['nplurals'])
+        )
+
+
+def _source_compatibility(pofile):
+    charset = _content_type_charset(pofile)
+    if charset and not _canonical_charset(charset):
+        raise ValueError('Unknown source charset: %s' % charset)
+    language = pofile.metadata.get('Language')
+    if language and not _normalize_language(language):
+        raise ValueError('Invalid Language header: %s' % language)
+    plural_forms = _parse_plural_forms(pofile.metadata.get('Plural-Forms'))
+    return {'language': language, 'plural_forms': plural_forms}
+
+
+def _metadata_from_manifest(manifest):
+    return dict((key, value) for key, value in manifest['metadata'])
+
+
+def _new_catalog_from_manifest(manifest, wrapwidth):
+    catalog = POFile(
+        encoding=manifest['encoding'],
+        wrapwidth=wrapwidth if wrapwidth is not None
+        else manifest.get('wrapwidth', 78)
+    )
+    catalog.header = manifest.get('header', '')
+    catalog.metadata = _metadata_from_manifest(manifest)
+    catalog.metadata_is_fuzzy = list(manifest.get('metadata_is_fuzzy', []))
+    return catalog
+
+
+def _new_catalog_like(catalog):
+    result = POFile(encoding=catalog.encoding, wrapwidth=catalog.wrapwidth)
+    result.header = catalog.header
+    result.metadata = catalog.metadata.copy()
+    result.metadata_is_fuzzy = list(catalog.metadata_is_fuzzy)
+    return result
+
+
+def _validate_manifest(manifest):
+    if manifest.get('version') != PO_ASSIGNMENT_MANIFEST_VERSION:
+        raise ValueError('Unsupported assignment manifest version')
+    for key in ('source', 'encoding', 'groups', 'assignments', 'metadata'):
+        if key not in manifest:
+            raise ValueError('Invalid assignment manifest: missing %s' % key)
+
+
+def _report(code, message, **details):
+    report = {'code': code, 'message': message}
+    report.update(details)
+    return report
+
+
+def _translation_payload(entry):
+    if entry.msgid_plural:
+        return True, dict((int(index), value) for index, value
+                          in entry.msgstr_plural.items())
+    return False, entry.msgstr
+
+
+def _baseline_translation(assignment):
+    if assignment['msgid_plural']:
+        return True, dict((int(index), value)
+                          for index, value in
+                          assignment.get('translation', {}).items())
+    return False, assignment.get('translation', '')
+
+
+def _apply_translation(entry, plural, payload):
+    if plural:
+        entry.msgstr = ''
+        entry.msgstr_plural = dict(payload)
+    else:
+        entry.msgstr = payload
+        entry.msgstr_plural = {}
+
+
+def _placeholder_entry(assignment, manifest):
+    plural_forms = manifest.get('plural_forms')
+    kwargs = {
+        'msgctxt': assignment['msgctxt'],
+        'msgid': assignment['msgid'],
+        'msgid_plural': assignment['msgid_plural'],
+        'occurrences': [(path, line) for path, line
+                        in assignment['occurrences']],
+    }
+    entry = POEntry(**kwargs)
+    if assignment['msgid_plural'] and plural_forms:
+        entry.msgstr_plural = dict(
+            (index, '') for index in range(plural_forms['nplurals'])
+        )
+    plural, payload = _baseline_translation(assignment)
+    _apply_translation(entry, plural, payload)
+    return entry
+
+
+def _merge_comments(existing, incoming):
+    lines = []
+    for value in [existing] + incoming:
+        if value:
+            lines.extend(value.split('\n'))
+    seen = set()
+    for line in lines:
+        if line not in seen:
+            seen.add(line)
+    return '\n'.join(sorted(seen))
+
+
+def _merge_flags(flags):
+    values = set()
+    for group_flags in flags:
+        values.update(group_flags)
+    return sorted(values)
+
+
+def _package_compatibility(package, manifest):
+    reports = []
+    actual_charset = _canonical_charset(package.encoding)
+    declared_charset = _canonical_charset(_content_type_charset(package) or
+                                          package.encoding)
+    if actual_charset != declared_charset:
+        reports.append(_report(
+            'encoding-mismatch',
+            'Package encoding does not match its Content-Type header.',
+            actual=package.encoding,
+            declared=declared_charset
+        ))
+    if _canonical_charset(manifest['encoding']) != actual_charset:
+        reports.append(_report(
+            'encoding-incompatible',
+            'Package encoding is incompatible with the split manifest.',
+            expected=manifest['encoding'],
+            actual=package.encoding
+        ))
+
+    expected_language = _normalize_language(manifest.get('language'))
+    actual_language = _normalize_language(package.metadata.get('Language'))
+    if expected_language and actual_language and \
+       expected_language != actual_language:
+        reports.append(_report(
+            'language-incompatible',
+            'Package Language header is incompatible with the split manifest.',
+            expected=manifest.get('language'),
+            actual=package.metadata.get('Language')
+        ))
+
+    expected_plural = manifest.get('plural_forms')
+    try:
+        actual_plural = _parse_plural_forms(
+            package.metadata.get('Plural-Forms')
+        )
+    except ValueError as error:
+        reports.append(_report(
+            'plural-forms-invalid', str(error),
+            actual=package.metadata.get('Plural-Forms')
+        ))
+        actual_plural = None
+    if expected_plural:
+        if actual_plural is None:
+            reports.append(_report(
+                'plural-forms-missing',
+                'Package is missing the expected Plural-Forms header.'
+            ))
+        elif actual_plural['nplurals'] != expected_plural['nplurals'] or \
+                actual_plural['expression'] != expected_plural['expression']:
+            reports.append(_report(
+                'plural-forms-incompatible',
+                'Package Plural-Forms are incompatible with the split manifest.',
+                expected=expected_plural['raw'],
+                actual=package.metadata.get('Plural-Forms')
+            ))
+        else:
+            for entry in package:
+                if entry.msgid_plural:
+                    try:
+                        _validate_plural_entry(entry, actual_plural)
+                    except ValueError as error:
+                        reports.append(_report(
+                            'plural-entry-invalid', str(error),
+                            identity=_entry_identity(entry)
+                        ))
+    return reports
+
+
+def _translation_decision(assignment, manifest, package_copies):
+    plural, baseline_payload = _baseline_translation(assignment)
+    changed = []
+    for group in assignment['groups']:
+        entry = package_copies.get(group, {}).get(assignment['identity'])
+        if entry is None:
+            continue
+        payload = _translation_payload(entry)[1]
+        if payload != baseline_payload:
+            changed.append((group, payload))
+
+    if not changed:
+        return {'status': 'unmodified', 'payload': baseline_payload,
+                'values': []}
+    distinct = []
+    for group, payload in changed:
+        if payload not in [item[1] for item in distinct]:
+            distinct.append((group, payload))
+
+    if len(distinct) == 1:
+        status = 'identical' if len(changed) > 1 else 'modified'
+        return {'status': status, 'payload': distinct[0][1],
+                'values': changed}
+    return {'status': 'conflict', 'payload': baseline_payload,
+            'values': changed}
+
+
+def _merged_entry(assignment, source_entry, manifest, package_copies, reports):
+    identity = assignment['identity']
+    if source_entry is None:
+        merged = _placeholder_entry(assignment, manifest)
+    else:
+        merged = copy.deepcopy(source_entry)
+        plural, baseline_payload = _baseline_translation(assignment)
+        _apply_translation(merged, plural, baseline_payload)
+
+    copies = []
+    for group in assignment['groups']:
+        if group not in package_copies:
+            continue
+        entry = package_copies[group].get(identity)
+        if entry is None:
+            reports.append(_report(
+                'package-entry-missing',
+                'An assigned package does not contain an expected entry.',
+                group=group,
+                identity=identity
+            ))
+            continue
+        copies.append(entry)
+
+    merged.tcomment = _merge_comments(
+        merged.tcomment, [entry.tcomment for entry in copies]
+    )
+    merged.comment = _merge_comments(
+        merged.comment, [entry.comment for entry in copies]
+    )
+
+    occurrences = set((path, line) for path, line in merged.occurrences)
+    for entry in copies:
+        occurrences.update(entry.occurrences)
+    merged.occurrences = sorted(occurrences)
+    merged.flags = _merge_flags(
+        [merged.flags] + [entry.flags for entry in copies]
+    )
+
+    for field in ('previous_msgctxt', 'previous_msgid',
+                  'previous_msgid_plural'):
+        baseline = getattr(merged, field)
+        changed_values = []
+        for entry in copies:
+            value = getattr(entry, field)
+            if value is not None and value != baseline and \
+               value not in changed_values:
+                changed_values.append(value)
+        if len(changed_values) > 1:
+            reports.append(_report(
+                'previous-field-conflict',
+                'Packages disagree on a previous-translation field.',
+                identity=identity,
+                field=field,
+                values=changed_values
+            ))
+        elif changed_values:
+            setattr(merged, field, changed_values[0])
+
+    decision = _translation_decision(
+        assignment, manifest, package_copies
+    )
+    if decision['status'] == 'conflict':
+        reports.append(_report(
+            'translation-conflict',
+            'Packages contain different translations for one identity.',
+            identity=identity,
+            msgctxt=assignment['msgctxt'],
+            msgid=assignment['msgid'],
+            groups=[group for group, payload in decision['values']],
+            translations=dict(
+                (group, _translation_as_json_payload(payload))
+                for group, payload in decision['values']
+            )
+        ))
+    _apply_translation(
+        merged, bool(assignment['msgid_plural']), decision['payload']
+    )
+    return merged, decision
 # }}}
 # class MOFile {{{
 

@@ -21,6 +21,14 @@ The ``detect_encoding`` function
 .. autofunction:: polib.detect_encoding
 
 
+Team assignment functions
+-------------------------
+
+.. autofunction:: polib.split_pofile
+
+.. autofunction:: polib.collect_pofile
+
+
 The ``escape`` function
 -----------------------
 
@@ -65,4 +73,3 @@ The ``_BaseFile`` class
 -----------------------
 .. autoclass:: polib._BaseFile
     :members:
-

@@ -2,7 +2,9 @@
 # -*- coding: utf-8 -*-
 
 import codecs
+import io
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -694,6 +696,239 @@ class TestPoFile(unittest.TestCase):
         po.merge(refpot)
         expected_po = polib.pofile('tests/test_merge_after.po')
         self.assertEqual(po, expected_po)
+
+    def test_split_and_collect_contexts_and_plural_conflict(self):
+        source = u('''msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\\n"
+"Language: zh_CN\\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\\n"
+
+#. app note
+#: app/views.py:1
+msgctxt "menu"
+msgid "Open"
+msgstr ""
+
+#: docs/page.rst:2
+msgctxt "action"
+msgid "Open"
+msgstr ""
+
+#: shared/menu.py:4
+msgid "Save"
+msgstr ""
+
+#: shared/lib.py:3
+msgid "%(count)s file"
+msgid_plural "%(count)s files"
+msgstr[0] ""
+msgstr[1] ""
+''')
+
+        tmpdir = tempfile.mkdtemp()
+        try:
+            source_path = os.path.join(tmpdir, 'messages.po')
+            packages_dir = os.path.join(tmpdir, 'packages')
+            release_path = os.path.join(tmpdir, 'release', 'messages.po')
+            with io.open(source_path, 'w', encoding='utf-8') as handle:
+                handle.write(source)
+
+            def groups_for(entry):
+                paths = set(path for path, line in entry.occurrences)
+                groups = []
+                if any(path.startswith('app/') for path in paths):
+                    groups.append('app')
+                if any(path.startswith('docs/') for path in paths):
+                    groups.append('docs')
+                if any(path.startswith('shared/') for path in paths):
+                    groups.extend(['app', 'docs'])
+                return groups
+
+            manifest = polib.split_pofile(
+                source_path, packages_dir, groups_for
+            )
+            app_package = polib.pofile(os.path.join(packages_dir, 'app.po'))
+            docs_package = polib.pofile(os.path.join(packages_dir, 'docs.po'))
+
+            self.assertEqual(len(app_package), 3)
+            self.assertEqual(len(docs_package), 3)
+            self.assertEqual(
+                [entry.msgctxt for entry in app_package],
+                ['menu', None, None]
+            )
+            self.assertEqual(
+                [entry.msgctxt for entry in docs_package],
+                ['action', None, None]
+            )
+            self.assertNotEqual(
+                manifest['assignments'][0]['identity'],
+                manifest['assignments'][1]['identity']
+            )
+
+            open_entry = app_package.find('Open', msgctxt='menu')
+            open_entry.msgstr = '打开菜单'
+            open_entry.tcomment = 'app wording'
+            open_entry.flags = ['fuzzy']
+
+            shared = app_package.find('%(count)s file')
+            shared.msgstr_plural[0] = '一个文件'
+            shared.msgstr_plural[1] = '多个文件'
+            shared.tcomment = 'app review'
+
+            shared = docs_package.find('%(count)s file')
+            shared.msgstr_plural[0] = '一个文件'
+            shared.msgstr_plural[1] = '若干文件'
+            shared.tcomment = 'docs review'
+
+            app_package.find('Save').msgstr = '保存'
+            docs_package.find('Save').msgstr = '保存'
+
+            app_package.save()
+            docs_package.save()
+            with io.open(source_path, 'r', encoding='utf-8') as handle:
+                self.assertEqual(handle.read(), source)
+
+            report = polib.collect_pofile(
+                os.path.join(
+                    packages_dir,
+                    polib.PO_ASSIGNMENT_MANIFEST_FILENAME
+                ),
+                release_path
+            )
+            release = polib.pofile(release_path)
+            plural_entry = release.find('%(count)s file')
+
+            self.assertEqual(report['conflicts'][0]['identity'],
+                             manifest['assignments'][3]['identity'])
+            self.assertEqual(plural_entry.msgstr_plural[0], '')
+            self.assertEqual(plural_entry.msgstr_plural[1], '')
+            self.assertEqual(
+                plural_entry.tcomment.split('\n'),
+                ['app review', 'docs review']
+            )
+            self.assertEqual(
+                release.find('Open', msgctxt='menu').msgstr,
+                '打开菜单'
+            )
+            self.assertEqual(
+                release.find('Open', msgctxt='menu').flags,
+                ['fuzzy']
+            )
+            self.assertEqual(
+                [entry.msgid_with_context for entry in release],
+                ['menu\x04Open', 'action\x04Open', 'Save', '%(count)s file']
+            )
+            statuses = dict((item['msgid'], item['status'])
+                            for item in report['entries'])
+            self.assertEqual(statuses['Save'], 'identical')
+            self.assertEqual(statuses['%(count)s file'], 'conflict')
+            self.assertFalse(os.path.isfile(
+                os.path.join(tmpdir, 'packages', 'messages.po')
+            ))
+        finally:
+            shutil.rmtree(tmpdir)
+
+    def test_collect_reports_missing_package_and_changed_source(self):
+        source = u('''msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\\n"
+
+#: shared/lib.py:1
+msgid "Shared"
+msgstr ""
+
+#: app/main.py:2
+msgid "App only"
+msgstr ""
+''')
+        tmpdir = tempfile.mkdtemp()
+        try:
+            source_path = os.path.join(tmpdir, 'messages.po')
+            packages_dir = os.path.join(tmpdir, 'packages')
+            release_path = os.path.join(tmpdir, 'release.po')
+            with io.open(source_path, 'w', encoding='utf-8') as handle:
+                handle.write(source)
+
+            manifest = polib.split_pofile(
+                source_path,
+                packages_dir,
+                lambda entry:
+                    ['app', 'docs']
+                    if entry.occurrences[0][0].startswith('shared/')
+                    else ['app']
+            )
+            os.remove(os.path.join(packages_dir, 'docs.po'))
+            with io.open(source_path, 'w', encoding='utf-8') as handle:
+                handle.write(source.replace('shared/lib.py:1',
+                                            'newshared/lib.py:1'))
+
+            report = polib.collect_pofile(
+                os.path.join(
+                    packages_dir,
+                    polib.PO_ASSIGNMENT_MANIFEST_FILENAME
+                ),
+                release_path
+            )
+            codes = set(item['code'] for item in report['reports'])
+
+            self.assertTrue(report['source_changed'])
+            self.assertEqual(report['packages']['docs'], 'missing')
+            self.assertIn('package-missing', codes)
+            self.assertIn('source-changed', codes)
+            self.assertIn('source-directories-changed', codes)
+        finally:
+            shutil.rmtree(tmpdir)
+
+    def test_collect_reports_encoding_and_plural_incompatibility(self):
+        source = u('''msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\\n"
+"Language: zh_CN\\n"
+"Plural-Forms: nplurals=2; plural=(n != 1);\\n"
+
+#: app/main.py:1
+msgid "File"
+msgid_plural "Files"
+msgstr[0] ""
+msgstr[1] ""
+''')
+        tmpdir = tempfile.mkdtemp()
+        try:
+            source_path = os.path.join(tmpdir, 'messages.po')
+            packages_dir = os.path.join(tmpdir, 'packages')
+            release_path = os.path.join(tmpdir, 'release.po')
+            with io.open(source_path, 'w', encoding='utf-8') as handle:
+                handle.write(source)
+            polib.split_pofile(
+                source_path, packages_dir,
+                lambda entry: ['app'],
+                groups=['app']
+            )
+
+            package_path = os.path.join(packages_dir, 'app.po')
+            package = polib.pofile(package_path)
+            package.metadata['Content-Type'] = \
+                'text/plain; charset=ISO-8859-15'
+            package.metadata['Plural-Forms'] = \
+                'nplurals=1; plural=0;'
+            package.encoding = 'iso-8859-15'
+            package.save()
+
+            report = polib.collect_pofile(
+                os.path.join(
+                    packages_dir,
+                    polib.PO_ASSIGNMENT_MANIFEST_FILENAME
+                ),
+                release_path
+            )
+            codes = set(item['code'] for item in report['reports'])
+
+            self.assertIn('encoding-incompatible', codes)
+            self.assertIn('plural-forms-incompatible', codes)
+        finally:
+            shutil.rmtree(tmpdir)
 
     def test_percent_translated(self):
         po = polib.pofile('tests/test_pofile_helpers.po')
