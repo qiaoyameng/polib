@@ -877,5 +877,135 @@ msgstr "oof"
         self.assertEqual(mo.__unicode__(), expected)
 
 
+class TestPluralForms(unittest.TestCase):
+    def make_catalog(self, plural_forms, msgstr_plural=None):
+        po = polib.POFile()
+        po.metadata['Plural-Forms'] = plural_forms
+        entry = polib.POEntry(
+            msgid='one',
+            msgid_plural='many',
+            msgstr_plural=msgstr_plural or {
+                0: 'one translation',
+                1: 'few translation',
+                2: 'many translation',
+            }
+        )
+        po.append(entry)
+        return po, entry
+
+    def test_three_plural_language_indexes(self):
+        plural_forms = (
+            'nplurals=3; '
+            'plural=(n%10==1 && n%100!=11 ? 0 : '
+            'n%10>=2 && n%10<=4 && (n%100<10 || n%100>=20) ? 1 : 2);'
+        )
+        self.assertEqual(polib.plural_index(plural_forms, 1), 0)
+        self.assertEqual(polib.plural_index(plural_forms, 2), 1)
+        self.assertEqual(polib.plural_index(plural_forms, 11), 2)
+        self.assertEqual(polib.plural_index(plural_forms, 21), 0)
+        self.assertEqual(polib.plural_index(plural_forms, 22), 1)
+
+    def test_c_integer_division_and_modulo(self):
+        plural_forms = polib.parse_plural_forms(
+            'nplurals=4; plural=(-7 / 2) + 10 * (-7 % 2);')
+        self.assertEqual(plural_forms.evaluate(0), -13)
+
+    def test_syntax_error(self):
+        with self.assertRaises(polib.PluralFormsSyntaxError):
+            polib.parse_plural_forms('nplurals=2; plural=n +;')
+
+    def test_division_by_zero(self):
+        plural_forms = polib.parse_plural_forms(
+            'nplurals=2; plural=n == 1 ? 0 : 1 / n;')
+        self.assertEqual(plural_forms.index(1), 0)
+        with self.assertRaises(polib.PluralFormsDivisionByZero):
+            plural_forms.index(0)
+
+    def test_negative_index(self):
+        plural_forms = polib.parse_plural_forms(
+            'nplurals=2; plural=-1;')
+        with self.assertRaises(polib.PluralFormsNegativeIndex):
+            plural_forms.index(0)
+
+    def test_bare_variable_at_end_of_expression(self):
+        plural_forms = polib.parse_plural_forms('nplurals=2; plural=n;')
+        self.assertEqual(plural_forms.evaluate(1), 1)
+        with self.assertRaises(polib.PluralFormsNegativeIndex):
+            plural_forms.index(-1)
+
+    def test_index_out_of_range(self):
+        plural_forms = polib.parse_plural_forms(
+            'nplurals=2; plural=n > 2 ? 2 : 0;')
+        with self.assertRaises(polib.PluralFormsIndexOutOfRange):
+            plural_forms.index(3)
+
+    def test_missing_and_unexpected_slots(self):
+        plural_forms = 'nplurals=3; plural=n == 1 ? 0 : 1;'
+        po, entry = self.make_catalog(
+            plural_forms, {0: 'one', 1: 'few', 3: 'other'})
+        result = po.check_plurals(ns=[])
+        self.assertEqual(result.kind, 'missing_slots')
+        self.assertEqual(result.missing, set([2]))
+
+        entry.msgstr_plural[2] = 'many'
+        result = po.check_plurals(ns=[])
+        self.assertEqual(result.kind, 'unexpected_slots')
+        self.assertEqual(result.unexpected, set([3]))
+
+        with self.assertRaises(polib.MissingPluralTranslationError):
+            polib.POEntry(
+                msgid='one',
+                msgid_plural='many',
+                msgstr_plural={0: 'one', 1: 'few'}
+            ).check_plural_slots(plural_forms)
+
+    def test_short_circuit_and_rare_counterexample(self):
+        plural_forms = (
+            'nplurals=2; '
+            'plural=(n != 0 && n / n == 1) ? '
+            '(n == 999999 ? 2 : 0) : 1;'
+        )
+        po, entry = self.make_catalog(
+            plural_forms, {0: 'one', 1: 'other'})
+        self.assertEqual(po.plural_index(0), 1)
+        self.assertIsNone(po.check_plurals(ns=[0, 1, 2]))
+
+        result = po.check_plurals(ns=[0, 1, 999999])
+        self.assertEqual(result.kind, 'index_out_of_range')
+        self.assertIs(result.entry, entry)
+        self.assertEqual(result.n, 999999)
+        self.assertEqual(result.index, 2)
+
+    def test_finite_interval_returns_first_counterexample(self):
+        po, entry = self.make_catalog(
+            'nplurals=2; plural=n < 3 ? 0 : 2;',
+            {0: 'one', 1: 'other'})
+        self.assertIsNone(po.check_plurals(0, 3))
+        result = po.check_plurals(0, 4)
+        self.assertEqual(result.kind, 'index_out_of_range')
+        self.assertIs(result.entry, entry)
+        self.assertEqual(result.n, 3)
+
+    def test_no_plural_entries_does_not_require_header(self):
+        po = polib.POFile()
+        po.append(polib.POEntry(msgid='one', msgstr='uno'))
+        self.assertIsNone(polib.check_plurals(po))
+        self.assertTrue(po.strict_translated())
+
+    def test_default_translated_behavior_is_unchanged(self):
+        plural_forms = 'nplurals=3; plural=n == 1 ? 0 : 1;'
+        entry = polib.POEntry(
+            msgid='one',
+            msgid_plural='many',
+            msgstr_plural={0: 'one', 1: 'few', 3: 'extra'}
+        )
+        self.assertTrue(entry.translated())
+        self.assertFalse(entry.strict_translated(plural_forms))
+
+        entry.msgstr_plural[2] = 'many'
+        del entry.msgstr_plural[3]
+        self.assertTrue(entry.strict_translated(plural_forms))
+
+
 if __name__ == '__main__':
     unittest.main()

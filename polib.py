@@ -25,7 +25,13 @@ import io
 __author__ = 'David Jean Louis <izimobil@gmail.com>'
 __version__ = '1.2.0'
 __all__ = ['pofile', 'POFile', 'POEntry', 'mofile', 'MOFile', 'MOEntry',
-           'default_encoding', 'escape', 'unescape', 'detect_encoding', ]
+           'default_encoding', 'escape', 'unescape', 'detect_encoding',
+           'PluralForms', 'parse_plural_forms', 'plural_index',
+           'check_plurals', 'PluralFormsError', 'PluralFormsSyntaxError',
+           'PluralFormsEvaluationError', 'PluralFormsDivisionByZero',
+           'PluralFormsNegativeIndex', 'PluralFormsIndexOutOfRange',
+           'PluralTranslationError', 'MissingPluralTranslationError',
+           'UnexpectedPluralTranslationError', 'PluralCheckResult']
 
 
 # the default encoding to use when encoding cannot be detected
@@ -53,6 +59,20 @@ else:
 
     def u(s):
         return s
+
+try:
+    integer_types = (int, long)
+except NameError:
+    integer_types = (int,)
+
+try:
+    integer_range = xrange
+except NameError:
+    integer_range = range
+
+
+def _is_integer(value):
+    return isinstance(value, integer_types) and not isinstance(value, bool)
 # }}}
 # _pofile_or_mofile {{{
 
@@ -286,6 +306,377 @@ def natural_sort(lst):
         return [convert(c) for c in re.split('([0-9]+)', key)]
 
     return sorted(lst, key=alphanum_key)
+
+# }}}
+# plural forms support {{{
+
+
+class PluralFormsError(ValueError):
+    """Base class for Plural-Forms errors."""
+
+
+class PluralFormsSyntaxError(PluralFormsError):
+    """Raised when a Plural-Forms header or expression is invalid."""
+
+    def __init__(self, message, position=None):
+        super(PluralFormsSyntaxError, self).__init__(message)
+        self.position = position
+
+
+class PluralFormsEvaluationError(PluralFormsError):
+    """Base class for Plural-Forms expression evaluation errors."""
+
+
+class PluralFormsDivisionByZero(PluralFormsEvaluationError):
+    """Raised when an evaluated expression divides by zero."""
+
+
+class PluralFormsNegativeIndex(PluralFormsEvaluationError):
+    """Raised when a plural expression evaluates to a negative index."""
+
+    def __init__(self, index, n):
+        message = 'plural index %s is negative for n=%s' % (index, n)
+        super(PluralFormsNegativeIndex, self).__init__(message)
+        self.index = index
+        self.n = n
+
+
+class PluralFormsIndexOutOfRange(PluralFormsEvaluationError):
+    """Raised when a plural index is greater than or equal to nplurals."""
+
+    def __init__(self, index, n, nplurals):
+        message = 'plural index %s is outside 0..%s for n=%s' % (
+            index, nplurals - 1, n)
+        super(PluralFormsIndexOutOfRange, self).__init__(message)
+        self.index = index
+        self.n = n
+        self.nplurals = nplurals
+
+
+class PluralTranslationError(ValueError):
+    """Base class for plural translation slot errors."""
+
+    def __init__(self, message, entry=None):
+        super(PluralTranslationError, self).__init__(message)
+        self.entry = entry
+
+
+class MissingPluralTranslationError(PluralTranslationError):
+    """Raised when a plural translation slot is missing."""
+
+    def __init__(self, missing, nplurals, entry=None):
+        message = 'missing plural translation slot(s): %s' % (
+            ', '.join([str(i) for i in sorted(missing)]))
+        super(MissingPluralTranslationError, self).__init__(message, entry)
+        self.missing = missing
+        self.nplurals = nplurals
+
+
+class UnexpectedPluralTranslationError(PluralTranslationError):
+    """Raised when an unexpected plural translation slot exists."""
+
+    def __init__(self, unexpected, nplurals, entry=None):
+        message = 'unexpected plural translation slot(s): %s' % (
+            ', '.join([str(i) for i in sorted(unexpected)]))
+        super(UnexpectedPluralTranslationError, self).__init__(
+            message, entry)
+        self.unexpected = unexpected
+        self.nplurals = nplurals
+
+
+class PluralCheckResult(object):
+    """Details about the first counterexample found by a finite check."""
+
+    def __init__(self, kind, entry=None, n=None, index=None, error=None,
+                 missing=None, unexpected=None):
+        self.kind = kind
+        self.entry = entry
+        self.n = n
+        self.index = index
+        self.error = error
+        self.missing = missing
+        self.unexpected = unexpected
+
+    def __repr__(self):
+        if self.entry is None:
+            msgid = None
+        else:
+            msgid = self.entry.msgid
+        return '<PluralCheckResult kind=%r msgid=%r n=%r index=%r>' % (
+            self.kind, msgid, self.n, self.index)
+
+
+class _PluralFormsTokenizer(object):
+    _two_char_operators = ('==', '!=', '<=', '>=', '&&', '||')
+    _one_char_operators = ('?', ':', '(', ')', '!', '<', '>', '+', '-',
+                           '*', '/', '%')
+
+    def __init__(self, expression):
+        self.expression = expression
+        self.tokens = []
+        self._tokenize()
+
+    def _tokenize(self):
+        expression = self.expression
+        position = 0
+        length = len(expression)
+        while position < length:
+            char = expression[position]
+            if char.isspace():
+                position += 1
+                continue
+            if char.isdigit():
+                end = position + 1
+                while end < length and expression[end].isdigit():
+                    end += 1
+                value = expression[position:end]
+                self.tokens.append(('number', int(value), position))
+                position = end
+                continue
+            if char == 'n':
+                next_position = position + 1
+                if next_position == length or (
+                        not expression[next_position].isalnum() and
+                        expression[next_position] != '_'):
+                    self.tokens.append(('name', 'n', position))
+                    position += 1
+                    continue
+            operator = expression[position:position + 2]
+            if operator in self._two_char_operators:
+                self.tokens.append(('operator', operator, position))
+                position += 2
+                continue
+            if char in self._one_char_operators:
+                self.tokens.append(('operator', char, position))
+                position += 1
+                continue
+            raise PluralFormsSyntaxError(
+                'unexpected character %r' % char, position)
+        self.tokens.append(('end', None, length))
+
+
+class _PluralFormsParser(object):
+    def __init__(self, expression):
+        self.tokens = _PluralFormsTokenizer(expression).tokens
+        self.position = 0
+
+    def parse(self):
+        node = self._parse_ternary()
+        token_type, _, token_pos = self._peek()
+        if token_type != 'end':
+            self._syntax_error('unexpected token', token_pos)
+        return node
+
+    def _peek(self):
+        return self.tokens[self.position]
+
+    def _next(self):
+        token = self.tokens[self.position]
+        self.position += 1
+        return token
+
+    def _expect(self, value):
+        token_type, token_value, token_pos = self._next()
+        if token_type != 'operator' or token_value != value:
+            self._syntax_error('expected %r' % value, token_pos)
+
+    def _syntax_error(self, message, position=None):
+        raise PluralFormsSyntaxError(message, position)
+
+    def _parse_ternary(self):
+        condition = self._parse_logical_or()
+        token_type, token_value, token_pos = self._peek()
+        if token_type == 'operator' and token_value == '?':
+            self._next()
+            when_true = self._parse_ternary()
+            self._expect(':')
+            when_false = self._parse_ternary()
+            return ('ternary', condition, when_true, when_false)
+        return condition
+
+    def _parse_binary(self, next_parser, operators):
+        left = next_parser()
+        while True:
+            token_type, token_value, token_pos = self._peek()
+            if token_type != 'operator' or token_value not in operators:
+                return left
+            self._next()
+            right = next_parser()
+            left = ('binary', token_value, left, right)
+
+    def _parse_logical_or(self):
+        return self._parse_binary(self._parse_logical_and, ('||',))
+
+    def _parse_logical_and(self):
+        return self._parse_binary(self._parse_equality, ('&&',))
+
+    def _parse_equality(self):
+        return self._parse_binary(self._parse_relational, ('==', '!='))
+
+    def _parse_relational(self):
+        return self._parse_binary(
+            self._parse_additive, ('<', '<=', '>', '>='))
+
+    def _parse_additive(self):
+        return self._parse_binary(self._parse_multiplicative, ('+', '-'))
+
+    def _parse_multiplicative(self):
+        return self._parse_binary(self._parse_unary, ('*', '/', '%'))
+
+    def _parse_unary(self):
+        token_type, token_value, token_pos = self._peek()
+        if token_type == 'operator' and token_value in ('-', '+', '!'):
+            self._next()
+            return ('unary', token_value, self._parse_unary())
+        return self._parse_primary()
+
+    def _parse_primary(self):
+        token_type, token_value, token_pos = self._next()
+        if token_type == 'number':
+            return ('number', token_value)
+        if token_type == 'name' and token_value == 'n':
+            return ('variable',)
+        if token_type == 'operator' and token_value == '(':
+            node = self._parse_ternary()
+            self._expect(')')
+            return node
+        self._syntax_error('unexpected token', token_pos)
+
+
+def _c_divmod(left, right):
+    if right == 0:
+        raise PluralFormsDivisionByZero('division or modulo by zero')
+    quotient = abs(left) // abs(right)
+    if (left < 0) != (right < 0):
+        quotient = -quotient
+    return quotient, left - quotient * right
+
+
+def _evaluate_plural_node(node, n):
+    node_type = node[0]
+    if node_type == 'number':
+        return node[1]
+    if node_type == 'variable':
+        return n
+    if node_type == 'unary':
+        operator = node[1]
+        value = _evaluate_plural_node(node[2], n)
+        if operator == '-':
+            return -value
+        if operator == '+':
+            return +value
+        return int(not value)
+    if node_type == 'binary':
+        operator = node[1]
+        if operator == '&&':
+            return int(
+                _evaluate_plural_node(node[2], n) and
+                _evaluate_plural_node(node[3], n))
+        if operator == '||':
+            return int(
+                _evaluate_plural_node(node[2], n) or
+                _evaluate_plural_node(node[3], n))
+        left = _evaluate_plural_node(node[2], n)
+        right = _evaluate_plural_node(node[3], n)
+        if operator == '+':
+            return left + right
+        if operator == '-':
+            return left - right
+        if operator == '*':
+            return left * right
+        if operator == '/':
+            return _c_divmod(left, right)[0]
+        if operator == '%':
+            return _c_divmod(left, right)[1]
+        if operator == '<':
+            return int(left < right)
+        if operator == '<=':
+            return int(left <= right)
+        if operator == '>':
+            return int(left > right)
+        if operator == '>=':
+            return int(left >= right)
+        if operator == '==':
+            return int(left == right)
+        if operator == '!=':
+            return int(left != right)
+    if node_type == 'ternary':
+        condition = _evaluate_plural_node(node[1], n)
+        branch = node[2] if condition else node[3]
+        return _evaluate_plural_node(branch, n)
+    raise PluralFormsEvaluationError('unsupported expression node')
+
+
+class PluralForms(object):
+    """Parsed representation of a gettext Plural-Forms header."""
+
+    def __init__(self, nplurals, expression, ast):
+        self.nplurals = nplurals
+        self.expression = expression
+        self.ast = ast
+
+    def evaluate(self, n):
+        """Evaluate the plural expression for ``n`` without range checks."""
+        if not _is_integer(n):
+            raise TypeError('n must be an integer')
+        return _evaluate_plural_node(self.ast, n)
+
+    def index(self, n):
+        """Return the valid plural translation index for ``n``."""
+        index = self.evaluate(n)
+        if index < 0:
+            raise PluralFormsNegativeIndex(index, n)
+        if index >= self.nplurals:
+            raise PluralFormsIndexOutOfRange(index, n, self.nplurals)
+        return index
+
+    def __repr__(self):
+        return '<PluralForms nplurals=%r expression=%r>' % (
+            self.nplurals, self.expression)
+
+
+def parse_plural_forms(value):
+    """
+    Parse a Plural-Forms header and return a :class:`PluralForms` instance.
+    """
+    if value is None:
+        raise PluralFormsError('missing Plural-Forms header')
+    if PY3 and isinstance(value, bytes):
+        value = value.decode('ascii')
+    if not isinstance(value, text_type) and not isinstance(value, str):
+        raise PluralFormsError('Plural-Forms must be a string')
+    match = re.match(
+        r'\s*nplurals\s*=\s*(\d+)\s*;\s*plural\s*=\s*(.*?)\s*;?\s*\Z',
+        value,
+        re.S
+    )
+    if match is None:
+        raise PluralFormsSyntaxError('invalid Plural-Forms header')
+    nplurals = int(match.group(1))
+    if nplurals < 1:
+        raise PluralFormsError('nplurals must be a positive integer')
+    expression = match.group(2)
+    ast = _PluralFormsParser(expression).parse()
+    return PluralForms(nplurals, expression, ast)
+
+
+def plural_index(plural_forms, n):
+    """Return the plural index selected by ``n``."""
+    if not isinstance(plural_forms, PluralForms):
+        plural_forms = parse_plural_forms(plural_forms)
+    return plural_forms.index(n)
+
+
+def check_plurals(catalog, start=0, stop=1000, ns=None,
+                  include_obsolete=False):
+    """
+    Check plural slots and a finite set of values.
+
+    Return the first :class:`PluralCheckResult`, or ``None``. A successful
+    finite check does not prove that the expression is valid for all integers.
+    """
+    return catalog.check_plurals(
+        start=start, stop=stop, ns=ns, include_obsolete=include_obsolete)
 
 # }}}
 # class _BaseFile {{{
@@ -549,6 +940,94 @@ class _BaseFile(list):
             value = metadata[data]
             ordered_data.append((data, value))
         return ordered_data
+
+    def plural_forms(self):
+        """Parse and return the catalog's Plural-Forms header."""
+        return parse_plural_forms(self.metadata.get('Plural-Forms'))
+
+    def plural_index(self, n, plural_forms=None):
+        """Return the plural index selected by ``n``."""
+        if plural_forms is None:
+            plural_forms = self.plural_forms()
+        elif not isinstance(plural_forms, PluralForms):
+            plural_forms = parse_plural_forms(plural_forms)
+        return plural_forms.index(n)
+
+    def check_plurals(self, start=0, stop=1000, ns=None,
+                      include_obsolete=False):
+        """
+        Check plural slots and evaluate the finite half-open range
+        ``range(start, stop)`` (or the explicit ``ns`` iterable).
+
+        The result ``None`` means that no counterexample was found in the
+        checked finite set; it is not a proof for all integers.
+        """
+        if include_obsolete:
+            entries = self[:]
+        else:
+            entries = [entry for entry in self if not entry.obsolete]
+        plural_entries = [
+            entry for entry in entries if entry.msgid_plural]
+        if not plural_entries:
+            return None
+        plural_forms = self.plural_forms()
+
+        if ns is None:
+            if not _is_integer(start):
+                raise TypeError('start must be an integer')
+            if not _is_integer(stop):
+                raise TypeError('stop must be an integer')
+            values = integer_range(start, stop)
+        else:
+            values = list(ns)
+            for n in values:
+                if not _is_integer(n):
+                    raise TypeError('ns must contain integers')
+
+        expected = set(integer_range(plural_forms.nplurals))
+        for entry in plural_entries:
+            actual = set(entry.msgstr_plural.keys())
+            missing = expected - actual
+            if missing:
+                return PluralCheckResult(
+                    'missing_slots', entry=entry, missing=missing)
+            unexpected = actual - expected
+            if unexpected:
+                return PluralCheckResult(
+                    'unexpected_slots', entry=entry,
+                    unexpected=unexpected)
+            for n in values:
+                try:
+                    index = plural_forms.index(n)
+                except PluralFormsDivisionByZero as error:
+                    return PluralCheckResult(
+                        'division_by_zero', entry=entry, n=n, error=error)
+                except PluralFormsNegativeIndex as error:
+                    return PluralCheckResult(
+                        'negative_index', entry=entry, n=n,
+                        index=error.index, error=error)
+                except PluralFormsIndexOutOfRange as error:
+                    return PluralCheckResult(
+                        'index_out_of_range', entry=entry, n=n,
+                        index=error.index, error=error)
+        return None
+
+    def strict_translated(self, start=0, stop=1000, ns=None):
+        """Check all current translations and plural rules over finite ns."""
+        has_plural_entries = False
+        plural_forms = None
+        for entry in self:
+            if entry.obsolete:
+                continue
+            if entry.msgid_plural:
+                if plural_forms is None:
+                    plural_forms = self.plural_forms()
+                has_plural_entries = True
+            if not entry.strict_translated(plural_forms):
+                return False
+        if not has_plural_entries:
+            return True
+        return self.check_plurals(start=start, stop=stop, ns=ns) is None
 
     def to_binary(self):
         """
@@ -1161,6 +1640,42 @@ class POEntry(_BaseEntry):
                     return False
             return True
         return False
+
+    def strict_translated(self, plural_forms=None):
+        """
+        Return ``True`` only when the entry has all expected translations.
+        """
+        if self.obsolete or getattr(self, 'fuzzy', False):
+            return False
+        if not self.msgid_plural:
+            return self.msgstr != ''
+        if plural_forms is None:
+            return False
+        if not isinstance(plural_forms, PluralForms):
+            plural_forms = parse_plural_forms(plural_forms)
+        expected = set(integer_range(plural_forms.nplurals))
+        actual = set(self.msgstr_plural.keys())
+        if actual != expected:
+            return False
+        for index in expected:
+            if self.msgstr_plural[index] == '':
+                return False
+        return True
+
+    def check_plural_slots(self, plural_forms):
+        """Raise an error if this plural entry misses or has extra slots."""
+        if not isinstance(plural_forms, PluralForms):
+            plural_forms = parse_plural_forms(plural_forms)
+        expected = set(integer_range(plural_forms.nplurals))
+        actual = set(self.msgstr_plural.keys())
+        missing = expected - actual
+        if missing:
+            raise MissingPluralTranslationError(
+                missing, plural_forms.nplurals, self)
+        unexpected = actual - expected
+        if unexpected:
+            raise UnexpectedPluralTranslationError(
+                unexpected, plural_forms.nplurals, self)
 
     def merge(self, other):
         """

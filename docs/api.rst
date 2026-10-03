@@ -33,6 +33,19 @@ The ``unescape`` function
 .. autofunction:: polib.unescape
 
 
+Plural forms
+------------
+
+.. autoclass:: polib.PluralForms
+    :members:
+
+.. autofunction:: polib.parse_plural_forms
+
+.. autofunction:: polib.plural_index
+
+.. autofunction:: polib.check_plurals
+
+
 The ``POFile`` class
 --------------------
 
@@ -65,4 +78,3 @@ The ``_BaseFile`` class
 -----------------------
 .. autoclass:: polib._BaseFile
     :members:
-
