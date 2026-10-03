@@ -877,5 +877,194 @@ msgstr "oof"
         self.assertEqual(mo.__unicode__(), expected)
 
 
+class TestPluralForms(unittest.TestCase):
+    """
+    Tests for the Plural-Forms parsing, evaluation and strict checking.
+    """
+
+    def _pofile(self, plural_forms, msgstr_plural):
+        po = polib.POFile()
+        po.metadata = {'Plural-Forms': plural_forms}
+        entry = polib.POEntry(
+            msgid='apple',
+            msgid_plural='apples',
+            msgstr_plural=msgstr_plural,
+        )
+        po.append(entry)
+        return po
+
+    def test_parse_nplurals_and_expression(self):
+        forms = polib.PluralForms.parse('nplurals=2; plural=(n != 1);')
+        self.assertEqual(forms.nplurals, 2)
+        self.assertEqual(forms.slot(1), 0)
+        self.assertEqual(forms.slot(0), 1)
+        self.assertEqual(forms.slot(5), 1)
+
+    def test_three_plural_language(self):
+        # Russian style rule with 3 slots
+        forms = polib.PluralForms.parse(
+            'nplurals=3; plural=n%10==1 && n%100!=11 ? 0 : '
+            'n%10>=2 && n%10<=4 && (n%100<10 || n%100>=20) ? 1 : 2;')
+        self.assertEqual(forms.nplurals, 3)
+        expected = {
+            1: 0, 21: 0, 101: 0,
+            2: 1, 4: 1, 22: 1, 104: 1,
+            0: 2, 5: 2, 11: 2, 25: 2, 111: 2,
+        }
+        for n, slot in expected.items():
+            self.assertEqual(forms.slot(n), slot, 'n=%d' % n)
+        self.assertIsNone(forms.check_range(0, 1000))
+
+    def test_nested_conditionals(self):
+        forms = polib.PluralForms.parse(
+            'nplurals=3; plural=n==0 ? 0 : (n==1 ? 1 : (n>1 ? 2 : 0));')
+        self.assertEqual(forms.slot(0), 0)
+        self.assertEqual(forms.slot(1), 1)
+        self.assertEqual(forms.slot(2), 2)
+        self.assertEqual(forms.slot(100), 2)
+
+    def test_short_circuit_avoids_division_by_zero(self):
+        # 10/n would raise for n == 0 if && did not short circuit
+        forms = polib.PluralForms.parse(
+            'nplurals=2; plural=n!=0 && 10/n > 1 ? 1 : 0;')
+        self.assertEqual(forms.slot(0), 0)
+        self.assertEqual(forms.slot(3), 1)
+        # same for || and the ternary operator
+        forms = polib.PluralForms.parse(
+            'nplurals=2; plural=n==0 || 10/n <= 1 ? 0 : 1;')
+        self.assertEqual(forms.slot(0), 0)
+        forms = polib.PluralForms.parse(
+            'nplurals=2; plural=n==0 ? 0 : (10/n > 1 ? 1 : 0);')
+        self.assertEqual(forms.slot(0), 0)
+        self.assertEqual(forms.slot(3), 1)
+
+    def test_c_style_division_and_modulo(self):
+        # gettext/C semantics: truncation towards zero
+        forms = polib.PluralForms.parse('nplurals=10; plural=n/2 + 5;')
+        self.assertEqual(forms.slot(-7), 2)  # -7/2 == -3, not -4
+        forms = polib.PluralForms.parse('nplurals=10; plural=n%3 + 3;')
+        self.assertEqual(forms.slot(-7), 2)  # -7%3 == -1, not 2
+
+    def test_division_by_zero(self):
+        forms = polib.PluralForms.parse(
+            'nplurals=2; plural=10/(n-3) > 1 ? 1 : 0;')
+        self.assertRaises(polib.PluralFormsEvaluationError, forms.slot, 3)
+        counterexample = forms.check_range(0, 10)
+        self.assertEqual(counterexample[0], 3)
+        self.assertIsInstance(counterexample[1],
+                              polib.PluralFormsEvaluationError)
+
+    def test_negative_index(self):
+        forms = polib.PluralForms.parse('nplurals=2; plural=n-2;')
+        self.assertRaises(polib.PluralFormsIndexError, forms.slot, 0)
+        self.assertEqual(forms.slot(2), 0)
+        self.assertEqual(forms.slot(3), 1)
+
+    def test_index_out_of_nplurals(self):
+        forms = polib.PluralForms.parse('nplurals=2; plural=n;')
+        self.assertRaises(polib.PluralFormsIndexError, forms.slot, 2)
+
+    def test_rare_n_counterexample(self):
+        # the rule only goes out of bounds for a single rare n
+        forms = polib.PluralForms.parse(
+            'nplurals=2; plural=n==12345 ? 5 : (n!=1);')
+        # a finite sample that misses n=12345 proves nothing globally
+        self.assertIsNone(forms.check_range(0, 1000))
+        counterexample = forms.check_range(0, 20000)
+        self.assertEqual(counterexample[0], 12345)
+        self.assertIsInstance(counterexample[1], polib.PluralFormsIndexError)
+
+    def test_syntax_errors(self):
+        bad_headers = [
+            'nplurals=2;',                       # missing plural
+            'plural=n;',                         # missing nplurals
+            'nplurals=x; plural=n;',             # invalid nplurals
+            'nplurals=0; plural=n;',             # nplurals too small
+            'nplurals=2; plural=n+;',            # truncated expression
+            'nplurals=2; plural=foo;',           # unknown identifier
+            'nplurals=2; plural=n $ 1;',         # invalid character
+            'nplurals=2; plural=(n;',            # unbalanced parenthesis
+            'nplurals=2; plural=n ? 1;',         # missing ':' branch
+            'nplurals=2; plural=n; extra=1;',    # unknown component
+        ]
+        for header in bad_headers:
+            self.assertRaises(polib.PluralFormsSyntaxError,
+                              polib.PluralForms.parse, header)
+
+    def test_check_plural_forms_ok(self):
+        po = self._pofile(
+            'nplurals=2; plural=(n != 1);',
+            {0: 'pomme', 1: 'pommes'},
+        )
+        self.assertEqual(po.check_plural_forms(), [])
+        self.assertEqual(po.plural_slot(1), 0)
+        self.assertEqual(po.plural_slot(7), 1)
+
+    def test_check_plural_forms_missing_and_extra_slots(self):
+        po = self._pofile(
+            'nplurals=3; plural=n%10==1 && n%100!=11 ? 0 : '
+            'n%10>=2 && n%10<=4 && (n%100<10 || n%100>=20) ? 1 : 2;',
+            {0: 'a', 2: 'c', 5: 'e'},
+        )
+        issues = po.check_plural_forms()
+        kinds = [issue.kind for issue in issues]
+        self.assertEqual(kinds, ['missing-plural-slot', 'extra-plural-slot'])
+        self.assertEqual(issues[0].entry, po[0])
+        self.assertEqual(issues[1].entry, po[0])
+
+    def test_check_plural_forms_missing_header(self):
+        po = polib.POFile()
+        issues = po.check_plural_forms()
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0].kind, 'invalid-plural-forms')
+
+    def test_check_plural_forms_first_counterexample(self):
+        po = self._pofile(
+            'nplurals=2; plural=n==500 ? 9 : (n!=1);',
+            {0: 'a', 1: 'b'},
+        )
+        # finite interval that does not include n=500: no issue found,
+        # which does not prove the rule is safe for all integers
+        self.assertEqual(po.check_plural_forms(n_max=100), [])
+        issues = po.check_plural_forms(n_max=1000)
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0].kind, 'invalid-plural-index')
+        self.assertEqual(issues[0].n, 500)
+
+    def test_check_plural_forms_strict(self):
+        po = self._pofile(
+            'nplurals=2; plural=n==500 ? 9 : (n!=1);',
+            {0: 'a', 1: 'b'},
+        )
+        self.assertRaises(polib.PluralFormsError,
+                          po.check_plural_forms, 0, 1000, True)
+
+    def test_check_plural_forms_obsolete_entries_ignored(self):
+        po = self._pofile(
+            'nplurals=2; plural=(n != 1);',
+            {0: 'a', 1: 'b'},
+        )
+        entry = polib.POEntry(
+            msgid='old', msgid_plural='olds',
+            msgstr_plural={0: 'x', 1: 'y', 2: 'z'},
+        )
+        entry.obsolete = True
+        po.append(entry)
+        self.assertEqual(po.check_plural_forms(), [])
+
+    def test_translated_behavior_unchanged(self):
+        # the strict check must not change the default translated()
+        entry = polib.POEntry(
+            msgid='apple', msgid_plural='apples',
+            msgstr_plural={0: 'pomme', 1: 'pommes'},
+        )
+        self.assertTrue(entry.translated())
+        entry.msgstr_plural[1] = ''
+        self.assertFalse(entry.translated())
+        entry.msgstr_plural[1] = 'pommes'
+        entry.flags.append('fuzzy')
+        self.assertFalse(entry.translated())
+
+
 if __name__ == '__main__':
     unittest.main()
