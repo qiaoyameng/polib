@@ -798,6 +798,215 @@ class TestPoFile(unittest.TestCase):
         self.assertTrue(pofile[0].fuzzy)
         self.assertFalse(pofile[1].fuzzy)
 
+class TestPreserveLayout(unittest.TestCase):
+    """
+    Tests for the optional ``preserve_layout`` mode: lexical parsing and
+    byte-for-byte preservation of untouched segments.
+    """
+
+    def _save(self, po, tmpdir):
+        path = os.path.join(tmpdir, 'out.po')
+        po.save(path)
+        with open(path, 'rb') as handler:
+            return handler.read()
+
+    def test_unchanged_file_is_byte_identical(self):
+        samples = [
+            'test_preserve_layout.po', 'test_ufeff.po', 'test_wrap.po',
+            'test_indented.po', 'test_previous_msgid.po',
+            'test_obsolete_previousmsgid.po', 'test_noencoding.po',
+            'test_pofile_helpers.po', 'test_word_garbage.po',
+            'test_unusual_metadata_location.po',
+        ]
+        tmpdir = tempfile.mkdtemp()
+        for name in samples:
+            with open('tests/%s' % name, 'rb') as handler:
+                original = handler.read()
+            po = polib.pofile('tests/%s' % name, preserve_layout=True)
+            self.assertEqual(
+                self._save(po, tmpdir), original,
+                'untouched rewrite must be byte identical for %s' % name
+            )
+
+    def test_single_msgstr_change_is_minimal(self):
+        tmpdir = tempfile.mkdtemp()
+        po = polib.pofile('tests/test_preserve_layout.po',
+                          preserve_layout=True)
+        # change a single msgstr of a hand-wrapped multi-line entry
+        long_entry = po[0]
+        original_lines = open('tests/test_preserve_layout.po',
+                              encoding='utf-8').read().splitlines()
+        long_entry.msgstr = 'Traduction courte'
+        out = self._save(po, tmpdir).decode('utf-8')
+        lines = out.splitlines()
+        # the original three msgstr lines collapse to a single one, but the
+        # hand-wrapped msgid lines and every other entry stay untouched
+        self.assertIn('msgstr "Traduction courte"', lines)
+        self.assertNotIn(
+            'physiques parce qu\'elle a ete coupee a la main', lines)
+        self.assertIn(
+            '"This is a deliberately long source string that spans several '
+            'physical "', lines)
+
+    def test_duplicate_msgid_disambiguated_by_context(self):
+        tmpdir = tempfile.mkdtemp()
+        po = polib.pofile('tests/test_preserve_layout.po',
+                          preserve_layout=True)
+        menu = po.find('Open', msgctxt='menu')
+        dialog = po.find('Open', msgctxt='dialog')
+        self.assertEqual(menu.msgstr, 'Ouvrir')
+        self.assertEqual(dialog.msgstr, 'Ouvrir le dialogue')
+        dialog.msgstr = 'Ouvrir la boite'
+        out = self._save(po, tmpdir).decode('utf-8')
+        reparsed = polib.pofile(out, preserve_layout=True)
+        self.assertEqual(
+            reparsed.find('Open', msgctxt='menu').msgstr, 'Ouvrir')
+        self.assertEqual(
+            reparsed.find('Open', msgctxt='dialog').msgstr,
+            'Ouvrir la boite')
+        # only one line changed in the whole file
+        changed = [l for l in out.splitlines() if 'Ouvrir la boite' in l]
+        self.assertEqual(len(changed), 1)
+
+    def test_plural_slot_change_is_targeted(self):
+        tmpdir = tempfile.mkdtemp()
+        po = polib.pofile('tests/test_preserve_layout.po',
+                          preserve_layout=True)
+        plural = [e for e in po if e.msgid_plural][0]
+        plural.msgstr_plural[1] = '%d fichiers effaces'
+        out = self._save(po, tmpdir).decode('utf-8')
+        reparsed = polib.pofile(out, preserve_layout=True)
+        again = [e for e in reparsed if e.msgid_plural][0]
+        self.assertEqual(again.msgstr_plural[0], 'un fichier supprime')
+        self.assertEqual(again.msgstr_plural[1], '%d fichiers effaces')
+        self.assertIn('msgstr[0] "un fichier supprime"', out)
+
+    def test_flag_change_rewrites_comments_only(self):
+        tmpdir = tempfile.mkdtemp()
+        po = polib.pofile('tests/test_preserve_layout.po',
+                          preserve_layout=True)
+        entry = po.find('Current')
+        self.assertTrue(entry.fuzzy)
+        entry.fuzzy = False
+        out = self._save(po, tmpdir).decode('utf-8')
+        reparsed = polib.pofile(out, preserve_layout=True)
+        self.assertFalse(reparsed.find('Current').fuzzy)
+        # previous msgid comment preserved
+        self.assertEqual(
+            reparsed.find('Current').previous_msgid,
+            'Old unused translation')
+        self.assertIn('#| msgid "Old unused translation"', out)
+        self.assertNotIn('#, fuzzy', out)
+
+    def test_obsolete_toggle_and_rewrite(self):
+        tmpdir = tempfile.mkdtemp()
+        po = polib.pofile('tests/test_preserve_layout.po',
+                          preserve_layout=True)
+        menu = po.find('Open', msgctxt='menu')
+        menu.obsolete = True
+        out = self._save(po, tmpdir).decode('utf-8')
+        reparsed = polib.pofile(out, preserve_layout=True)
+        self.assertIsNone(reparsed.find('Open', msgctxt='menu'))
+        found = reparsed.find('Open', msgctxt='menu',
+                              include_obsolete_entries=True)
+        self.assertTrue(found.obsolete)
+        self.assertIn('#~ msgid "Open"', out)
+        self.assertIn('#~ msgstr "Ouvrir"', out)
+
+    def test_insert_and_delete_keep_stable_positions(self):
+        tmpdir = tempfile.mkdtemp()
+        po = polib.pofile('tests/test_preserve_layout.po',
+                          preserve_layout=True)
+        dialog = po.find('Open', msgctxt='dialog')
+        position = po.index(dialog)
+        po.remove(dialog)
+        new_entry = polib.POEntry(msgid='Brand new', msgstr='Tout nouveau')
+        po.insert(position, new_entry)
+        out = self._save(po, tmpdir).decode('utf-8')
+        reparsed = polib.pofile(out, preserve_layout=True)
+        self.assertIsNone(reparsed.find('Open', msgctxt='dialog'))
+        self.assertEqual(reparsed.find('Brand new').msgstr, 'Tout nouveau')
+        # the menu twin is still there, proving identity based location
+        self.assertEqual(
+            reparsed.find('Open', msgctxt='menu').msgstr, 'Ouvrir')
+
+    def test_bom_and_crlf_are_preserved(self):
+        tmpdir = tempfile.mkdtemp()
+        data = (
+            b'\xef\xbb\xbfmsgid ""\r\nmsgstr ""\r\n'
+            b'"Content-Type: text/plain; charset=UTF-8\\n"\r\n\r\n'
+            b'msgid "Hi"\r\nmsgstr ""\r\n'
+        )
+        path = os.path.join(tmpdir, 'crlf.po')
+        with open(path, 'wb') as handler:
+            handler.write(data)
+        po = polib.pofile(path, preserve_layout=True)
+        po[0].msgstr = 'Salut'
+        with open(os.path.join(tmpdir, 'out.po'), 'wb') as handler:
+            po.save(handler.name)
+        with open(os.path.join(tmpdir, 'out.po'), 'rb') as handler:
+            out = handler.read()
+        self.assertTrue(out.startswith(codecs.BOM_UTF8))
+        body = out[len(codecs.BOM_UTF8):]
+        self.assertNotIn(b'\n', body.replace(b'\r\n', b''))
+        self.assertIn(b'msgstr "Salut"\r\n', body)
+
+    def test_unencodable_content_raises(self):
+        tmpdir = tempfile.mkdtemp()
+        data = (
+            'msgid ""\nmsgstr ""\n'
+            '"Content-Type: text/plain; charset=ISO-8859-1\\n"\n\n'
+            'msgid "Hi"\nmsgstr ""\n'
+        ).encode('latin-1')
+        path = os.path.join(tmpdir, 'l1.po')
+        with open(path, 'wb') as handler:
+            handler.write(data)
+        po = polib.pofile(path, preserve_layout=True)
+        po[0].msgstr = u('\u3053\u3093\u306b\u3061\u306f')
+        out_path = os.path.join(tmpdir, 'out.po')
+        self.assertRaises(UnicodeEncodeError, po.save, out_path)
+
+    def test_charset_change_reencodes_whole_file(self):
+        tmpdir = tempfile.mkdtemp()
+        data = (
+            'msgid ""\nmsgstr ""\n'
+            '"Content-Type: text/plain; charset=ISO-8859-1\\n"\n\n'
+            'msgid "Cafe"\nmsgstr "Caf\\xe9"\n'
+        ).encode('latin-1')
+        path = os.path.join(tmpdir, 'l1.po')
+        with open(path, 'wb') as handler:
+            handler.write(data)
+        po = polib.pofile(path, preserve_layout=True)
+        po.metadata['Content-Type'] = 'text/plain; charset=UTF-8'
+        po[0].msgstr = u('Caf\u00e9\u2014moteur')
+        po.save(os.path.join(tmpdir, 'out.po'))
+        with open(os.path.join(tmpdir, 'out.po'), 'rb') as handler:
+            raw = handler.read()
+        # the whole file is valid UTF-8 with a single charset declaration
+        text = raw.decode('utf-8')
+        self.assertIn('charset=UTF-8', text)
+        self.assertNotIn('charset=ISO-8859-1', text)
+        self.assertIn(u('Caf\u00e9\u2014moteur'), text)
+        reparsed = polib.pofile(raw, preserve_layout=True)
+        self.assertEqual(reparsed.encoding.lower(), 'utf-8')
+        self.assertEqual(
+            reparsed[0].msgstr, u('Caf\u00e9\u2014moteur'))
+
+    def test_reparse_after_field_edit(self):
+        tmpdir = tempfile.mkdtemp()
+        po = polib.pofile('tests/test_preserve_layout.po',
+                          preserve_layout=True)
+        po[0].msgstr = 'Nouvelle valeur'
+        po.find('Open', msgctxt='menu').flags.append('python-format')
+        out = self._save(po, tmpdir)
+        reparsed = polib.pofile(out, preserve_layout=True)
+        self.assertEqual(reparsed[0].msgstr, 'Nouvelle valeur')
+        self.assertIn('python-format',
+                      reparsed.find('Open', msgctxt='menu').flags)
+        # number of entries preserved
+        self.assertEqual(len(reparsed), len(po))
+
+
 class TestMoFile(unittest.TestCase):
     """
     Tests for MoFile class.

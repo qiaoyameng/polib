@@ -68,7 +68,11 @@ def _pofile_or_mofile(f, type, **kwargs):
         enc = detect_encoding(f, type == 'mofile')
 
     # parse the file
-    kls = type == 'pofile' and _POFileParser or _MOFileParser
+    preserve_layout = kwargs.get('preserve_layout', False)
+    if type == 'pofile' and preserve_layout:
+        kls = _POFileLayoutParser
+    else:
+        kls = type == 'pofile' and _POFileParser or _MOFileParser
     parser = kls(
         f,
         encoding=enc,
@@ -77,6 +81,7 @@ def _pofile_or_mofile(f, type, **kwargs):
     )
     instance = parser.parse()
     instance.wrapwidth = kwargs.get('wrapwidth', 78)
+    instance.preserve_layout = preserve_layout
     return instance
 # }}}
 # _is_file {{{
@@ -121,6 +126,12 @@ def pofile(pofile, **kwargs):
     ``check_for_duplicates``
         whether to check for duplicate entries when adding entries to the
         file (optional, default: ``False``).
+
+    ``preserve_layout``
+        when ``True``, the source file is split into lexical segments on
+        load.  On save, untouched segments are kept byte-for-byte (BOM,
+        line endings, wrapping and spacing) and only the changed fields
+        are rewritten (optional, default: ``False``).
 
     ``klass``
         class which is used to instantiate the return value (optional,
@@ -315,6 +326,11 @@ class _BaseFile(list):
         ``check_for_duplicates``
             whether to check for duplicate entries when adding entries to the
             file, (optional, default: ``False``).
+
+        ``preserve_layout``
+            when ``True``, :meth:`save` preserves the original formatting of
+            untouched segments and rewrites only the changed fields
+            (optional, default: ``False``).
         """
         list.__init__(self)
         # the opened file handle
@@ -329,6 +345,10 @@ class _BaseFile(list):
         self.encoding = kwargs.get('encoding', default_encoding)
         # whether to check for duplicate entries or not
         self.check_for_duplicates = kwargs.get('check_for_duplicates', False)
+        # whether to preserve the original formatting of the file on save
+        self.preserve_layout = kwargs.get('preserve_layout', False)
+        # lexical layout recorded when preserve_layout is enabled
+        self._layout = None
         # header
         self.header = ''
         # both po and mo files have metadata
@@ -448,13 +468,22 @@ class _BaseFile(list):
         """
         if self.fpath is None and fpath is None:
             raise IOError('You must provide a file path to save() method')
-        contents = getattr(self, repr_method)()
         if fpath is None:
             fpath = self.fpath
         if repr_method == 'to_binary':
+            contents = getattr(self, repr_method)()
             with open(fpath, 'wb') as fhandle:
                 fhandle.write(contents)
+        elif getattr(self, 'preserve_layout', False) and self._layout \
+                is not None:
+            # lexical, byte-preserving rewrite
+            text, encoding, bom_char = self._layout_serialize()
+            data = _encode_layout_text(text, encoding, bom_char)
+            with open(fpath, 'wb') as fhandle:
+                fhandle.write(data)
+            self.encoding = encoding
         else:
+            contents = getattr(self, repr_method)()
             with io.open(
                 fpath,
                 'w',
@@ -668,6 +697,305 @@ class POFile(_BaseFile):
             ret = ret.decode(self.encoding)
 
         return ret + _BaseFile.__unicode__(self)
+
+    def _layout_serialize(self):
+        """
+        Rebuild the file text from the recorded lexical layout, rewriting
+        only the segments that changed.
+
+        Untouched segments are copied byte-for-byte (BOM, line endings,
+        wrapping and spacing).  Entries are located by object identity so
+        duplicate msgids and entries differing only by msgctxt never
+        collapse.  Deleted entries disappear with their comments and new
+        entries are rendered next to their neighbours in list order.
+
+        Returns ``(text, encoding, bom_char)``; ``text`` does not contain
+        the BOM (it is prepended at encode time).
+        """
+        import difflib
+
+        layout = self._layout
+        lines = layout.lines
+        terminators = layout.terminators
+        newline = layout.newline
+
+        header_entry = self._layout_header_entry
+
+        # Build the canonical header text.  The header is only rewritten
+        # when the metadata mapping or the metadata fuzzy state actually
+        # changed, so raw/non canonical headers stay byte-for-byte intact.
+        header_override = None
+        source_charset = None
+        if header_entry is not None:
+            refreshed = self.metadata_as_entry()
+            source_charset = _metadata_charset(
+                self._layout_metadata_snapshot())
+            fuzzy_now = bool(self.metadata_is_fuzzy)
+            fuzzy_then = 'fuzzy' in (layout.header_snapshot[9] or [])
+            if refreshed.msgstr != layout.metadata_canonical or \
+                    fuzzy_now != fuzzy_then:
+                if not fuzzy_now:
+                    refreshed.flags = [f for f in refreshed.flags
+                                       if f != 'fuzzy']
+                header_override = refreshed
+        target_charset = _metadata_charset(self.metadata)
+        encoding = layout.encoding
+        if target_charset and (not source_charset or
+                               codecs.lookup(target_charset).name !=
+                               codecs.lookup(source_charset).name):
+            encoding = target_charset
+
+        first_entry = None
+        for seg in layout.segments:
+            if seg[0] == 'entry':
+                first_entry = seg[1]
+                break
+        leading_header = header_entry if header_entry is first_entry else None
+
+        ranges = {}
+        regular_originals = []
+        for seg in layout.segments:
+            if seg[0] != 'entry':
+                continue
+            ranges[id(seg[1])] = (seg[2], seg[3])
+            if seg[1] is not leading_header:
+                regular_originals.append(seg[1])
+
+        detached_header_ids = set()
+        if header_entry is not None and header_entry is not leading_header:
+            detached_header_ids.add(id(header_entry))
+
+        current = list(self)
+
+        sm = difflib.SequenceMatcher(a=regular_originals, b=current,
+                                     autojunk=False)
+        # An ordered stream of output tokens:
+        #   ('orig', entry)  -> render original entry at its source range
+        #   ('new', entry)   -> render a brand new (or moved) entry
+        # Genuinely deleted originals simply do not appear.  Moved entries
+        # appear only at their new position ('new'), rendered from their
+        # original bytes so identity and formatting both stay stable.
+        output_tokens = []
+        emitted_originals = set()
+        for tag, i1, i2, j1, j2 in sm.get_opcodes():
+            if tag == 'equal':
+                for entry in regular_originals[i1:i2]:
+                    output_tokens.append(('orig', entry))
+                    emitted_originals.add(id(entry))
+            elif tag == 'delete':
+                for entry in regular_originals[i1:i2]:
+                    emitted_originals.add(id(entry))
+            elif tag == 'insert':
+                for entry in current[j1:j2]:
+                    output_tokens.append(
+                        ('orig', entry) if id(entry) in ranges
+                        else ('new', entry))
+            elif tag == 'replace':
+                for entry in regular_originals[i1:i2]:
+                    emitted_originals.add(id(entry))
+                for entry in current[j1:j2]:
+                    output_tokens.append(
+                        ('orig', entry) if id(entry) in ranges
+                        else ('new', entry))
+        token_ids = set()
+        for kind, entry in output_tokens:
+            token_ids.add(id(entry))
+        # original entries that must no longer be emitted at their source
+        # position (deleted, or moved to a different place in the list)
+        streamed_orig_ids = set(
+            id(entry) for kind, entry in output_tokens if kind == 'orig')
+        hidden_ranges = []
+        for entry in regular_originals:
+            if id(entry) not in streamed_orig_ids:
+                hidden_ranges.append(ranges[id(entry)])
+            else:
+                # an 'orig' token rendered out of source order (moved) must
+                # also be hidden at its original location
+                pass
+        # detect moved originals: same id appears as orig token but the
+        # token order no longer matches the source order
+        ordered_streamed = [id(e) for k, e in output_tokens if k == 'orig']
+        source_ordered = [id(e) for e in regular_originals
+                          if id(e) in streamed_orig_ids]
+        moved_ids = set()
+        if ordered_streamed != source_ordered:
+            # any orig token whose position changed relative to its peers
+            src_pos = {id_: i for i, id_ in enumerate(source_ordered)}
+            last = -1
+            for id_ in ordered_streamed:
+                pos = src_pos.get(id_, -1)
+                if pos < last:
+                    moved_ids.add(id_)
+                last = max(last, pos)
+        hidden_ranges = sorted(
+            hidden_ranges + [ranges[id_] for id_ in moved_ids])
+
+        def hidden_at(index):
+            for hr0, hr1 in hidden_ranges:
+                if hr0 <= index < hr1:
+                    return True
+            return False
+
+        def render_kept(entry):
+            r0, r1 = ranges[id(entry)]
+            snapshot = layout.entry_snapshots.get(id(entry))
+            if snapshot is None or \
+                    _entry_layout_snapshot(entry) == snapshot:
+                return [lines[i] + terminators[i]
+                        for i in range(r0, r1)]
+            original = _snapshot_to_entry(snapshot, entry.encoding)
+            if _entry_has_structural_change(entry, original):
+                return [ln + newline for ln in _render_entry_body(entry)]
+            fields = _scan_entry_fields(lines, r0, r1)
+            replaced = _rewrite_field_lines(lines, r0, r1, entry, original,
+                                            fields)
+            return [replaced[i] + terminators[r0 + i]
+                    for i in range(len(replaced))]
+
+        def render_new(entry):
+            return [ln + newline for ln in _render_entry_body(entry)] + \
+                   [newline]
+
+        def render_token(kind, entry):
+            if kind == 'orig' and id(entry) in ranges and \
+                    id(entry) not in moved_ids:
+                return render_kept(entry)
+            if id(entry) in moved_ids:
+                # moved entries keep their source bytes but gain a standard
+                # blank separator at their new position
+                return render_kept(entry) + [newline]
+            return render_new(entry)
+
+        pieces = []
+
+        def emit_raw(a, b):
+            pieces.extend(lines[i] + terminators[i]
+                          for i in range(a, b))
+
+        cursor = 0
+
+        def emit_leading_header():
+            nonlocal cursor
+            head_end = ranges[id(leading_header)][0]
+            emit_raw(cursor, head_end)
+            cursor = head_end
+            r0, r1 = ranges[id(leading_header)]
+            if header_override is not None:
+                pieces.extend(
+                    [ln + newline for ln in
+                     _render_entry_body(header_override)])
+                if r1 > r0 and not lines[r1 - 1].strip():
+                    pieces.append(newline)
+            else:
+                emit_raw(r0, r1)
+            cursor = r1
+
+        if leading_header is not None:
+            emit_leading_header()
+        elif self.header:
+            first_start = None
+            for seg in layout.segments:
+                if seg[0] == 'entry':
+                    first_start = seg[2]
+                    break
+            head_end = first_start if first_start is not None \
+                else len(lines)
+            emit_raw(cursor, head_end)
+            cursor = head_end
+
+        # Track detached (mid-file) metadata entries: they are not in the
+        # regular entry stream but their bytes must survive in place.
+        detached_handled = set()
+
+        for kind, entry in output_tokens:
+            r0, r1 = ranges.get(id(entry), (None, None))
+            if r0 is None:
+                # brand new entry, anchor it at the current cursor
+                pieces.extend(render_token(kind, entry))
+                continue
+            # emit any detached metadata blocks and raw gaps that sit
+            # between the cursor and this entry's original position
+            for seg in layout.segments:
+                if seg[0] != 'entry':
+                    continue
+                sentry, sr0, sr1 = seg[1], seg[2], seg[3]
+                if id(sentry) in detached_header_ids and \
+                        id(sentry) not in detached_handled and \
+                        sr0 >= cursor and sr0 <= r0:
+                    emit_raw(cursor, sr0)
+                    if header_override is not None:
+                        pieces.extend(
+                            [ln + newline for ln in
+                             _render_entry_body(header_override)])
+                        if sr1 > sr0 and not lines[sr1 - 1].strip():
+                            pieces.append(newline)
+                    else:
+                        emit_raw(sr0, sr1)
+                    cursor = sr1
+                    detached_handled.add(id(sentry))
+            if r0 > cursor:
+                k = cursor
+                while k < r0:
+                    if hidden_at(k):
+                        k += 1
+                        continue
+                    pieces.append(lines[k] + terminators[k])
+                    k += 1
+            if id(entry) in moved_ids and pieces and \
+                    not pieces[-1].endswith(newline + newline) and \
+                    pieces[-1] != newline:
+                pieces.append(newline)
+            pieces.extend(render_token(kind, entry))
+            if kind == 'orig' and id(entry) not in moved_ids:
+                cursor = r1
+            else:
+                cursor = max(cursor, r1) if id(entry) in moved_ids \
+                    else cursor
+
+        # any detached metadata entries after the last streamed entry
+        for seg in layout.segments:
+            if seg[0] != 'entry':
+                continue
+            sentry, sr0, sr1 = seg[1], seg[2], seg[3]
+            if id(sentry) in detached_header_ids and \
+                    id(sentry) not in detached_handled and sr0 >= cursor:
+                emit_raw(cursor, sr0)
+                if header_override is not None:
+                    pieces.extend(
+                        [ln + newline for ln in
+                         _render_entry_body(header_override)])
+                    if sr1 > sr0 and not lines[sr1 - 1].strip():
+                        pieces.append(newline)
+                else:
+                    emit_raw(sr0, sr1)
+                cursor = sr1
+                detached_handled.add(id(sentry))
+
+        k = cursor
+        while k < len(lines):
+            if not hidden_at(k):
+                pieces.append(lines[k] + terminators[k])
+            k += 1
+        return ''.join(pieces), encoding, layout.bom
+
+    def _layout_metadata_snapshot(self):
+        """
+        Rebuild the metadata mapping as recorded at parse time so the
+        serializer can detect metadata and charset changes.
+        """
+        header_entry = getattr(self, '_layout_header_entry', None)
+        if header_entry is None:
+            return {}
+        metadata = {}
+        key = None
+        for msg in header_entry.msgstr.splitlines():
+            if ':' in msg:
+                k, val = msg.split(':', 1)
+                metadata[k] = val.strip()
+                key = k
+            elif key is not None:
+                metadata[key] += '\n' + msg.strip()
+        return metadata
 
     def save_as_mofile(self, fpath):
         """
@@ -1680,6 +2008,593 @@ class _POFileParser(object):
             self.current_entry.previous_msgctxt += token
         # don't change the current state
         return False
+# }}}
+# layout preserving support {{{
+#
+# Everything below implements the optional ``preserve_layout`` mode.  The
+# source file is split into lexical segments (raw gaps and entry blocks).
+# On save, untouched segments are emitted byte-for-byte (BOM, line endings,
+# wrapping and spacing) while only the fields that changed are rewritten.
+# Entries are located by object identity, so duplicate msgids and entries
+# sharing a msgid but differing by msgctxt never collapse.
+
+_NEWLINE_SPLIT_RE = re.compile(r'\r\n|\n|\r')
+
+# BOM byte prefixes mapped to the codec used to decode a file carrying them.
+_LAYOUT_BOMS = (
+    (codecs.BOM_UTF32_LE, 'utf-32-le'),
+    (codecs.BOM_UTF32_BE, 'utf-32-be'),
+    (codecs.BOM_UTF16_LE, 'utf-16-le'),
+    (codecs.BOM_UTF16_BE, 'utf-16-be'),
+    (codecs.BOM_UTF8,      'utf-8-sig'),
+)
+
+
+def _split_lines_keepends(text):
+    """
+    Split ``text`` into lines, keeping the line terminator (LF, CR, CRLF).
+    Unlike ``str.splitlines()`` this never splits on bare control characters
+    (``\\v``, ``\\f``, ...) that may legitimately appear inside PO strings.
+    """
+    lines = []
+    start = 0
+    for match in _NEWLINE_SPLIT_RE.finditer(text):
+        lines.append(text[start:match.end()])
+        start = match.end()
+    if start < len(text):
+        lines.append(text[start:])
+    return lines
+
+
+def _detect_newline(lines):
+    """Return the dominant line terminator used by ``lines`` (default LF)."""
+    crlf = sum(1 for ln in lines if ln.endswith('\r\n'))
+    lf = sum(1 for ln in lines
+             if ln.endswith('\n') and not ln.endswith('\r\n'))
+    cr = sum(1 for ln in lines
+             if ln.endswith('\r') and not ln.endswith('\r\n'))
+    counts = (crlf, lf, cr)
+    if max(counts) == 0:
+        return '\n'
+    return ('\r\n', '\n', '\r')[counts.index(max(counts))]
+
+
+def _entry_layout_snapshot(entry):
+    """
+    Value based snapshot of every lexical field of ``entry``.  Two
+    snapshots are equal if and only if the textual representation of the
+    entry is unchanged.
+    """
+    return (
+        entry.msgctxt,
+        entry.msgid,
+        entry.msgid_plural,
+        entry.msgstr,
+        dict(entry.msgstr_plural),
+        entry.obsolete,
+        entry.comment,
+        entry.tcomment,
+        list(entry.occurrences),
+        list(entry.flags),
+        entry.previous_msgctxt,
+        entry.previous_msgid,
+        entry.previous_msgid_plural,
+    )
+
+
+def _snapshot_to_entry(snapshot, encoding=default_encoding):
+    """
+    Build a lightweight object from a value snapshot so changed fields can
+    be compared without access to the original entry instance.
+    """
+    if snapshot is None:
+        return None
+
+    class _Snap(object):
+        pass
+
+    snap = _Snap()
+    (snap.msgctxt, snap.msgid, snap.msgid_plural, snap.msgstr,
+     snap.msgstr_plural, snap.obsolete, snap.comment, snap.tcomment,
+     snap.occurrences, snap.flags, snap.previous_msgctxt,
+     snap.previous_msgid, snap.previous_msgid_plural) = snapshot
+    snap.msgstr_plural = dict(snap.msgstr_plural)
+    snap.occurrences = list(snap.occurrences)
+    snap.flags = list(snap.flags)
+    snap.encoding = encoding
+    return snap
+
+
+class _Layout(object):
+    """Container for all the information needed to rewrite a po file."""
+
+    def __init__(self):
+        self.encoding = None
+        self.bom = ''
+        self.newline = '\n'
+        self.lines = []
+        self.terminators = []
+        # ordered list of ('raw', start, end) or ('entry', entry, start, end)
+        self.segments = []
+        self.entry_snapshots = {}
+        self.header_entry = None
+        self.header_snapshot = None
+        self.header_comment_end = 0
+        self.original_header = None
+        self.metadata_canonical = None
+
+
+class _POFileLayoutParser(_POFileParser):
+    """
+    A :class:`~polib._POFileParser` subclass that additionally records the
+    raw, lexical layout of the file (line endings, BOM and the line spans
+    of every entry and comment) so subsequent saves can rewrite only the
+    fields that were modified.
+    """
+
+    def __init__(self, pofile, *args, **kwargs):
+        enc = kwargs.get('encoding', default_encoding)
+        text, bom, used_encoding = self._decode_source(pofile, enc)
+        kwargs['encoding'] = used_encoding
+
+        self._layout = _Layout()
+        self._layout.encoding = used_encoding
+        self._layout.bom = bom
+        raw_lines = _split_lines_keepends(text)
+        self._layout.lines = [ln.rstrip('\r\n') for ln in raw_lines]
+        self._layout.terminators = [ln[len(ln.rstrip('\r\n')):]
+                                    for ln in raw_lines]
+        self._layout.newline = _detect_newline(raw_lines)
+
+        # finalized entry events as (entry, start, end), 1-based indices
+        self._events = []
+        # 1-based line indices of file header comment lines
+        self._he_indices = []
+        # 1-based creation line of the current entry
+        self._current_created = 1
+        # creation line / "seen" flag for the very first entry
+        self._first_created = 1
+        self._first_seen = False
+
+        super(_POFileLayoutParser, self).__init__(
+            text, *args, **kwargs
+        )
+        # The parent parser uses ``str.splitlines()`` on string input,
+        # which wrongly treats bare control characters (\v, \f, ...) inside
+        # quoted strings as line terminators.  Feed it lines split only on
+        # real newline terminators instead, and strip a leading BOM from
+        # the first line the same way the parent parser does.
+        fsm_lines = [ln.rstrip('\r\n') for ln in
+                     _split_lines_keepends(text)]
+        if fsm_lines and fsm_lines[0].startswith('\ufeff'):
+            fsm_lines[0] = fsm_lines[0][1:]
+        self.fhandle = fsm_lines
+        if _is_file(pofile):
+            self.instance.fpath = pofile
+
+    @staticmethod
+    def _decode_source(pofile, encoding):
+        """
+        Return ``(text, bom, encoding)`` for a path, bytes or decoded text.
+        Decoding is strict so undecodable source fails loudly.
+        """
+        if _is_file(pofile):
+            with open(pofile, 'rb') as fhandle:
+                raw = fhandle.read()
+        elif isinstance(pofile, bytes):
+            raw = pofile
+        else:
+            if pofile and pofile[0] == codecs.BOM_UTF8.decode('utf-8'):
+                return pofile[1:], codecs.BOM_UTF8.decode('utf-8'), encoding
+            return pofile, '', encoding
+
+        bom_prefix = None
+        bom_encoding = None
+        for prefix, candidate in _LAYOUT_BOMS:
+            if raw.startswith(prefix):
+                bom_prefix = prefix
+                bom_encoding = candidate
+                break
+        if bom_encoding is not None:
+            decoded = raw.decode(bom_encoding)
+            bom = '\ufeff'
+            text = decoded[1:] if decoded.startswith('\ufeff') else decoded
+            used = bom_encoding.replace('-sig', '')
+        else:
+            text = raw.decode(encoding)
+            used = encoding
+            bom = ''
+        return text, bom, used
+
+    def process(self, symbol):
+        if not getattr(self, '_process_wrapped', False):
+            original_append = self.instance.append
+
+            def tracking_append(entry):
+                self._record_append(entry)
+                return original_append(entry)
+
+            self.instance.append = tracking_append
+            self._process_wrapped = True
+
+        line_no = self.current_line
+        before_entry = self.current_entry
+        before_state = self.current_state
+        super(_POFileLayoutParser, self).process(symbol)
+        after_entry = self.current_entry
+
+        # translator comments seen while in the initial header state
+        if symbol == 'tc' and \
+                (before_state == 'st' or self.current_state == 'he'):
+            self._he_indices.append(line_no)
+
+        if after_entry is not before_entry:
+            start = self._span_start(line_no)
+            self._current_created = start
+            if not self._first_seen:
+                self._first_created = start
+                self._first_seen = True
+        elif not self._first_seen and symbol != 'tc':
+            start = self._span_start(line_no)
+            self._current_created = start
+            self._first_created = start
+            self._first_seen = True
+
+    def _record_append(self, entry):
+        """The state machine finalized ``entry`` on the current line."""
+        start = self._current_created
+        next_start = self._span_start(self.current_line)
+        end = next_start - 1
+        self._events.append((entry, start, end))
+
+    def _span_start(self, line_no):
+        """
+        Return the 1-based start line of an entry whose first line is
+        ``line_no``, walking backwards over its attached comments and blank
+        lines but never past the file header comments.
+        """
+        last_he = self._he_indices[-1] if self._he_indices else 0
+        i = line_no
+        start = line_no
+        while i - 1 > last_he:
+            stripped = self._layout.lines[i - 2].strip()
+            if stripped == '':
+                i -= 1
+                continue
+            if stripped[0] != '#':
+                break
+            start = i - 1
+            i -= 1
+        return start
+
+    def parse(self):
+        instance = super(_POFileLayoutParser, self).parse()
+        self._build_layout()
+        return instance
+
+    def _build_layout(self):
+        layout = self._layout
+        lines = layout.lines
+        if self._events:
+            entry, start, end = self._events[-1]
+            self._events[-1] = (entry, start, len(lines))
+
+        segments = []
+        cursor = 1
+        header_entry = None
+        for entry, start, end in self._events:
+            if start > cursor:
+                segments.append(('raw', cursor - 1, start - 1))
+            segments.append(('entry', entry, start - 1, end))
+            cursor = end + 1
+            if header_entry is None and entry.msgid == '':
+                header_entry = entry
+        if cursor <= len(lines):
+            segments.append(('raw', cursor - 1, len(lines)))
+
+        if self._he_indices:
+            layout.header_comment_end = self._he_indices[-1] - 1
+        layout.header_entry = header_entry
+
+        instance = self.instance
+        if header_entry is not None:
+            layout.original_header = instance.header
+            layout.header_snapshot = _entry_layout_snapshot(header_entry)
+            layout.metadata_canonical = \
+                instance.metadata_as_entry().msgstr
+
+        if header_entry is not None and header_entry in instance:
+            instance.remove(header_entry)
+
+        for seg in segments:
+            if seg[0] == 'entry' and seg[1] is not header_entry:
+                layout.entry_snapshots[id(seg[1])] = \
+                    _entry_layout_snapshot(seg[1])
+        layout.segments = segments
+        instance._layout = layout
+        instance._layout_header_entry = header_entry
+# }}}
+# layout preserving serializer {{{
+
+
+def _encode_layout_text(text, encoding, bom_char):
+    """
+    Encode ``text`` strictly with ``encoding`` and prepend the BOM bytes
+    matching ``bom_char`` (if any).  A charset change is applied to the
+    whole output so the file can never end up with mixed encodings; any
+    character that cannot be represented raises ``UnicodeEncodeError``.
+    """
+    body = text.encode(encoding)
+    if not bom_char:
+        return body
+    codec = codecs.lookup(encoding).name
+    if codec in ('utf-8', 'utf8', 'cp65001'):
+        return codecs.BOM_UTF8 + body
+    if codec == 'utf-16-le':
+        return codecs.BOM_UTF16_LE + body
+    if codec == 'utf-16-be':
+        return codecs.BOM_UTF16_BE + body
+    if codec == 'utf-16':
+        return codecs.BOM_UTF16 + body
+    if codec == 'utf-32-le':
+        return codecs.BOM_UTF32_LE + body
+    if codec == 'utf-32-be':
+        return codecs.BOM_UTF32_BE + body
+    if codec == 'utf-32':
+        return codecs.BOM_UTF32 + body
+    raise UnicodeEncodeError(
+        encoding, bom_char, 0, 1,
+        'cannot write a BOM with the %r codec' % encoding)
+
+
+_OBSOLETE_FIELD_RE = re.compile(
+    r'^#~\s*(?:msgid_plural|msgstr\[|msgstr|msgid|msgctxt)(?:\b|\s|\[)')
+
+
+def _first_keyword_line(lines, start, end):
+    """
+    Return the index of the first field line.  Obsolete fields are written
+    with a ``#~ `` prefix but are field lines, not comments.
+    """
+    for i in range(start, end):
+        stripped = lines[i].strip()
+        if not stripped:
+            continue
+        if stripped.startswith('#'):
+            if _OBSOLETE_FIELD_RE.match(stripped):
+                return i
+            continue
+        return i
+    return end
+
+
+def _scan_entry_fields(lines, start, end):
+    """
+    Scan the raw block ``lines[start:end]`` and return a dict mapping each
+    quoted field to its 0-based ``(start, end)`` line range.  Keys are
+    ``msgctxt``, ``msgid``, ``msgid_plural``, ``msgstr`` and ``msgstr_N``.
+    Per-field styling (indentation and separator whitespace) is stored in
+    ``_styles``.
+    """
+    fields = {}
+    styles = {}
+    i = start
+    while i < end:
+        stripped = lines[i].strip()
+        if stripped.startswith('#~ '):
+            body = stripped[3:].strip()
+        elif stripped == '#~':
+            body = ''
+        else:
+            body = stripped
+        if not body or body[0] == '#':
+            i += 1
+            continue
+        tokens = body.split(None, 1)
+        keyword = tokens[0]
+        line_body = lines[i]
+        indent = line_body[:len(line_body) - len(line_body.lstrip())]
+        quote_pos = body.find('"')
+        separator = body[len(keyword):quote_pos] if quote_pos != -1 else ' '
+        j = i + 1
+        while j < end:
+            cs = lines[j].strip()
+            if cs.startswith('#~ '):
+                cont = cs[3:].strip()
+            elif cs == '#~':
+                cont = ''
+            else:
+                cont = cs
+            if cont.startswith('"'):
+                j += 1
+            else:
+                break
+
+        def record(key):
+            fields[key] = (i, j)
+            styles[key] = (indent, separator)
+
+        if keyword.startswith('msgstr[') and ']' in keyword:
+            close = keyword.index(']')
+            try:
+                record('msgstr_%d' % int(keyword[7:close]))
+            except ValueError:
+                pass
+        elif keyword in ('msgctxt', 'msgid', 'msgid_plural', 'msgstr'):
+            record(keyword)
+        i = j if j > i else i + 1
+    fields['_styles'] = styles
+    return fields
+
+
+def _entry_has_structural_change(entry, original):
+    """
+    True when the entry cannot be updated by replacing field lines in
+    place: the obsolete marker toggles, or a quoted field appears or
+    disappears.
+    """
+    if entry.obsolete != original.obsolete:
+        return True
+    if (entry.msgctxt is None) != (original.msgctxt is None):
+        return True
+    if bool(entry.msgid_plural) != bool(original.msgid_plural):
+        return True
+    if bool(entry.msgstr_plural) != bool(original.msgstr_plural):
+        return True
+    if entry.msgstr_plural and \
+            set(entry.msgstr_plural) != set(original.msgstr_plural):
+        return True
+    return False
+
+
+def _field_native_lines(key, value, obsolete):
+    """Render a quoted field using the standard polib rules."""
+    delflag = '#~ ' if obsolete else ''
+    if key.startswith('msgstr_'):
+        index = int(key[7:])
+        return POEntry()._str_field('msgstr', delflag, '[%d]' % index,
+                                    value, 78)
+    keyword = {
+        'msgctxt': 'msgctxt', 'msgid': 'msgid',
+        'msgid_plural': 'msgid_plural', 'msgstr': 'msgstr',
+    }[key]
+    return POEntry()._str_field(keyword, delflag, '', value, 78)
+
+
+def _render_standard_field(key, value, obsolete, indent='', separator=' '):
+    """Render one quoted field preserving its original indent/separator."""
+    rendered = _field_native_lines(key, value, obsolete)
+    if indent:
+        rendered = [indent + line if line else line for line in rendered]
+    if separator != ' ':
+        first = rendered[0]
+        if obsolete and first.startswith('#~ '):
+            prefix, rest = '#~ ', first[3:]
+        else:
+            prefix, rest = '', first
+        token = ('msgstr[%d]' % int(key[7:])) if key.startswith('msgstr_') \
+            else {
+                'msgctxt': 'msgctxt', 'msgid': 'msgid',
+                'msgid_plural': 'msgid_plural', 'msgstr': 'msgstr'}[key]
+        if '"' in rest:
+            quoted = rest[rest.index('"'):]
+            rest = token + separator + quoted
+            rendered[0] = prefix + rest
+    return rendered
+
+
+def _comments_changed(entry, original):
+    """True when any comment-related lexical data changed."""
+    return (
+        entry.comment != original.comment or
+        entry.tcomment != original.tcomment or
+        list(entry.occurrences) != list(original.occurrences) or
+        list(entry.flags) != list(original.flags) or
+        entry.previous_msgctxt != original.previous_msgctxt or
+        entry.previous_msgid != original.previous_msgid or
+        entry.previous_msgid_plural != original.previous_msgid_plural
+    )
+
+
+def _render_comment_lines(entry):
+    """Render the comment portion of an entry (without terminators)."""
+    out = []
+    comment_sets = [('tcomment', '# ')] if entry.obsolete else \
+                   [('tcomment', '# '), ('comment', '#. ')]
+    for attr, prefix in comment_sets:
+        value = getattr(entry, attr)
+        if value:
+            for line in value.split('\n'):
+                out.append('%s%s' % (prefix, line))
+    if not entry.obsolete and entry.occurrences:
+        refs = []
+        for fpath, lineno in entry.occurrences:
+            refs.append('%s:%s' % (fpath, lineno) if lineno else fpath)
+        out.append('#: ' + ' '.join(refs))
+    if entry.flags:
+        out.append('#, %s' % ', '.join(entry.flags))
+    previous_prefix = '#~| ' if entry.obsolete else '#| '
+    for attr, name in (('previous_msgctxt', 'msgctxt'),
+                       ('previous_msgid', 'msgid'),
+                       ('previous_msgid_plural', 'msgid_plural')):
+        value = getattr(entry, attr)
+        if value is not None:
+            out.extend(POEntry()._str_field(
+                name, previous_prefix, '', value, 78))
+    return out
+
+
+def _rewrite_field_lines(lines, start, end, entry, original, fields):
+    """
+    Return the replacement block for an entry whose structure is unchanged.
+    Every original line is copied verbatim except the leading comment region
+    (regenerated when comment data changed) and the quoted field lines whose
+    textual value changed.
+    """
+    changes = {}
+    styles = fields.get('_styles', {})
+
+    def schedule(key, new_value):
+        rng = fields.get(key)
+        if rng is not None:
+            indent, separator = styles.get(key, ('', ' '))
+            changes[rng] = _render_standard_field(
+                key, new_value, entry.obsolete, indent, separator)
+
+    if entry.msgctxt is not None and entry.msgctxt != original.msgctxt:
+        schedule('msgctxt', entry.msgctxt)
+    if entry.msgid != original.msgid:
+        schedule('msgid', entry.msgid)
+    if entry.msgid_plural and \
+            entry.msgid_plural != original.msgid_plural:
+        schedule('msgid_plural', entry.msgid_plural)
+    if entry.msgstr_plural:
+        for index, value in entry.msgstr_plural.items():
+            if value != original.msgstr_plural.get(index):
+                schedule('msgstr_%d' % index, value)
+    if not entry.msgstr_plural and entry.msgstr != original.msgstr:
+        schedule('msgstr', entry.msgstr)
+
+    comment_end = _first_keyword_line(lines, start, end)
+    comments_changed = _comments_changed(entry, original)
+
+    if not changes and not comments_changed:
+        return list(lines[start:end])
+
+    out = []
+    if comments_changed:
+        out.extend(_render_comment_lines(entry))
+    else:
+        out.extend(lines[start:comment_end])
+
+    cursor = comment_end
+    for rng in sorted(changes):
+        r0, r1 = rng
+        if r0 < comment_end or r0 < cursor:
+            continue
+        out.extend(lines[cursor:r0])
+        out.extend(changes[rng])
+        cursor = r1
+    out.extend(lines[cursor:end])
+    return out
+
+
+def _render_entry_body(entry):
+    """
+    Render an entry the standard way, dropping the trailing blank
+    separator that ``__unicode__`` appends.
+    """
+    text = entry.__unicode__(78)
+    result = [ln.rstrip('\r\n') for ln in _split_lines_keepends(text)]
+    while result and result[-1] == '':
+        result.pop()
+    return result
+
+
+def _metadata_charset(metadata):
+    match = re.search(r'charset=([\w_\-:\.]+)',
+                      metadata.get('Content-Type', ''))
+    return match.group(1).strip() if match else None
 # }}}
 # class _MOFileParser {{{
 

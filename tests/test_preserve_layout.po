@@ -1,0 +1,41 @@
+# Sample file for preserve_layout checks.
+# It contains duplicate msgids disambiguated by msgctxt and hand-wrapped
+# multi-line fields that must be left byte-for-byte untouched.
+msgid ""
+msgstr ""
+"Project-Id-Version: test\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+
+#: src/app.py:10
+#. Extracted comment for the shared source string.
+msgid ""
+"This is a deliberately long source string that spans several physical "
+"lines because it was hand wrapped by a translator who really enjoyed "
+"typing very, very, very long sentences with %s placeholders inside"
+msgstr ""
+"Voici une longue chaine source qui s'etend sur plusieurs lignes "
+"physiques parce qu'elle a ete coupee a la main par un traducteur avec "
+"des espaces reserves %s au milieu du texte sans raison particuliere"
+
+msgctxt "menu"
+msgid "Open"
+msgstr "Ouvrir"
+
+msgctxt "dialog"
+msgid "Open"
+msgstr "Ouvrir le dialogue"
+
+msgid "One file removed"
+msgid_plural "%d files removed"
+msgstr[0] "un fichier supprime"
+msgstr[1] "%d fichiers supprimes"
+
+#, fuzzy
+#| msgid "Old unused translation"
+msgid "Current"
+msgstr ""
+
+# Deprecated entry kept around for reference.
+#~ msgid "Obsolete thing"
+#~ msgstr "Chose obsolete"
