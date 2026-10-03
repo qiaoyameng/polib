@@ -14,6 +14,7 @@ modify entries, comments or metadata, etc. or create new po files from scratch.
 
 import array
 import codecs
+import mmap
 import os
 import re
 import struct
@@ -25,7 +26,8 @@ import io
 __author__ = 'David Jean Louis <izimobil@gmail.com>'
 __version__ = '1.2.0'
 __all__ = ['pofile', 'POFile', 'POEntry', 'mofile', 'MOFile', 'MOEntry',
-           'default_encoding', 'escape', 'unescape', 'detect_encoding', ]
+           'lazy_mofile', 'LazyMOFile', 'default_encoding', 'escape',
+           'unescape', 'detect_encoding', ]
 
 
 # the default encoding to use when encoding cannot be detected
@@ -62,6 +64,15 @@ def _pofile_or_mofile(f, type, **kwargs):
     Internal function used by :func:`polib.pofile` and :func:`polib.mofile` to
     honor the DRY concept.
     """
+    if type == 'mofile' and kwargs.get('lazy', False):
+        kls = kwargs.get('klass') or LazyMOFile
+        return kls(
+            f,
+            encoding=kwargs.get('encoding'),
+            check_for_duplicates=kwargs.get('check_for_duplicates', False),
+            wrapwidth=kwargs.get('wrapwidth', 78)
+        )
+
     # get the file encoding
     enc = kwargs.get('encoding')
     if enc is None:
@@ -160,8 +171,29 @@ def mofile(mofile, **kwargs):
         class which is used to instantiate the return value (optional,
         default: ``None``, the return value with be a :class:`~polib.POFile`
         instance).
+
+    ``lazy``
+        boolean, return a read-only :class:`~polib.LazyMOFile` instead of
+        decoding all entries immediately (optional, default: ``False``).
     """
     return _pofile_or_mofile(mofile, 'mofile', **kwargs)
+# }}}
+# function lazy_mofile() {{{
+
+
+def lazy_mofile(mofile, **kwargs):
+    """
+    Convenience function that opens a read-only and lazily decoded view of
+    the mo file ``mofile``.
+
+    Arguments:
+
+    ``mofile``
+        string, full or relative path to the mo file or a seekable binary
+        file-like object containing it.
+    """
+    kwargs['lazy'] = True
+    return mofile(mofile, **kwargs)
 # }}}
 # function detect_encoding() {{{
 
